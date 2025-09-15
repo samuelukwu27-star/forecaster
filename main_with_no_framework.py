@@ -6,15 +6,12 @@ import os
 import sys
 from dotenv import load_dotenv
 
-# --- FIX for ModuleNotFoundError ---
-# Add the project root directory to the Python path.
-# This ensures that the 'bots' module can be found regardless of how the script is executed.
+# Add the project root directory to the Python path to ensure modules can be found.
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
-# ------------------------------------
 
-from forecaster.bots.top_model_bot import TopModelBot
-
+# CORRECTED: The import should be relative to the project root, not from a 'forecaster' package.
+from bots.top_model_bot import TopModelBot
 
 # Load environment variables from .env file for local development
 load_dotenv()
@@ -22,7 +19,6 @@ load_dotenv()
 def get_new_questions_from_metaculus():
     """
     Placeholder function to simulate fetching questions.
-    In production, this should make an API call to Metaculus.
     """
     print("Fetching new questions from Metaculus...")
     return [
@@ -38,7 +34,6 @@ def get_new_questions_from_metaculus():
 def submit_forecast_to_metaculus(question_id, probability, rationale):
     """
     Placeholder function for submitting a forecast.
-    In production, this should make an API call to Metaculus.
     """
     print("\n--- (SIMULATED) SUBMITTING FORECAST ---")
     print(f"Question ID: {question_id}")
