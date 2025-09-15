@@ -3,7 +3,16 @@
 # the overhead of a larger framework.
 
 import os
+import sys
 from dotenv import load_dotenv
+
+# --- FIX for ModuleNotFoundError ---
+# Add the project root directory to the Python path.
+# This ensures that the 'bots' module can be found regardless of how the script is executed.
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+# ------------------------------------
+
 from bots.top_model_bot import TopModelBot
 
 # Load environment variables from .env file for local development
@@ -17,7 +26,7 @@ def get_new_questions_from_metaculus():
     print("Fetching new questions from Metaculus...")
     return [
         {
-            "id": "minibench", # Changed to use the string "minibench" as requested.
+            "id": "minibench",
             "title": "Will global EV sales surpass 30% of all car sales in 2030?",
             "type": "binary",
             "background": "Government incentives and battery tech advancements are key drivers.",
@@ -40,7 +49,6 @@ def submit_forecast_to_metaculus(question_id, probability, rationale):
 if __name__ == "__main__":
     print("--- Starting Top Model Bot (No Framework) ---")
     
-    # CORRECTED: Using METACULUS_TOKEN as requested.
     if not os.getenv("METACULUS_TOKEN"):
         raise ValueError("METACULUS_TOKEN is not set. Check your repository secrets.")
 
