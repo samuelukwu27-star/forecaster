@@ -12,11 +12,12 @@ load_dotenv()
 def get_new_questions_from_metaculus():
     """
     Placeholder function to simulate fetching questions.
+    In production, this should make an API call to Metaculus.
     """
     print("Fetching new questions from Metaculus...")
     return [
         {
-            "id": 10001,
+            "id": "minibench", # Changed to use the string "minibench" as requested.
             "title": "Will global EV sales surpass 30% of all car sales in 2030?",
             "type": "binary",
             "background": "Government incentives and battery tech advancements are key drivers.",
@@ -27,6 +28,7 @@ def get_new_questions_from_metaculus():
 def submit_forecast_to_metaculus(question_id, probability, rationale):
     """
     Placeholder function for submitting a forecast.
+    In production, this should make an API call to Metaculus.
     """
     print("\n--- (SIMULATED) SUBMITTING FORECAST ---")
     print(f"Question ID: {question_id}")
@@ -38,8 +40,9 @@ def submit_forecast_to_metaculus(question_id, probability, rationale):
 if __name__ == "__main__":
     print("--- Starting Top Model Bot (No Framework) ---")
     
+    # CORRECTED: Using METACULUS_TOKEN as requested.
     if not os.getenv("METACULUS_TOKEN"):
-        raise ValueError("METACULUS_TOKEN is not set.")
+        raise ValueError("METACULUS_TOKEN is not set. Check your repository secrets.")
 
     bot = TopModelBot()
     questions = get_new_questions_from_metaculus()
@@ -54,3 +57,4 @@ if __name__ == "__main__":
                 print(f"Failed to produce a forecast for question {question['id']}.")
     
     print("--- Top Model Bot (No Framework) finished. ---")
+
