@@ -38,8 +38,8 @@ def submit_forecast_to_metaculus(question_id, probability, rationale):
 if __name__ == "__main__":
     print("--- Starting Top Model Bot (No Framework) ---")
     
-    if not os.getenv("METACULUS_API_KEY"):
-        raise ValueError("METACULUS_API_KEY is not set.")
+    if not os.getenv("METACULUS_TOKEN"):
+        raise ValueError("METACULUS_TOKEN is not set.")
 
     bot = TopModelBot()
     questions = get_new_questions_from_metaculus()
