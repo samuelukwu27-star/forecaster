@@ -13,7 +13,8 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 # ------------------------------------
 
-from bots.top_model_bot import TopModelBot
+from forecaster.bots.top_model_bot import TopModelBot
+
 
 # Load environment variables from .env file for local development
 load_dotenv()
