@@ -27,7 +27,7 @@ jobs:
           pip install poetry
 
       - name: Regenerate lock file
-        run: poetry lock --no-update
+        run: poetry lock
       
       - name: Install dependencies with Poetry
         run: |
@@ -36,8 +36,9 @@ jobs:
       - name: Run Top Model Bot
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          METACULUS_API_KEY: ${{ secrets.METACULUS_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           # The SEARCH_PROVIDER_API_KEY is optional if web scraping works reliably
           # SEARCH_PROVIDER_API_KEY: ${{ secrets.SEARCH_PROVIDER_API_KEY }}
         run: poetry run python main_with_no_framework.py
+
 
