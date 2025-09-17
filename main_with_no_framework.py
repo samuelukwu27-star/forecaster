@@ -1,5 +1,4 @@
-# ./main_with_no_framework.py
-# A forecasting bot using a free OpenRouter model for reasoning, 
+# A forecasting bot using top OpenRouter models for reasoning,
 # with research powered by NewsAPI and direct web scraping.
 
 import asyncio
@@ -35,8 +34,9 @@ NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
 newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY) if NEWSAPI_API_KEY else None
 
 # --- OpenRouter Configuration ---
-# Using a free, high-quality model available on OpenRouter
-OPENROUTER_MODEL = "meta-llama/llama-3-8b-instruct:free" 
+# Using the best models available on OpenRouter, as requested.
+# "o1" is interpreted as openai/gpt-4o, a top-tier omni model.
+OPENROUTER_MODELS = ["openai/gpt-4", "openai/gpt-4o"]
 APP_URL = "https://github.com/your-repo/forecaster" # For OpenRouter headers
 APP_TITLE = "Metaculus Forecasting Bot" # For OpenRouter headers
 
@@ -127,26 +127,26 @@ def get_post_details(post_id: int) -> dict:
 CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
-async def call_llm(prompt: str, temperature: float = 0.3) -> str:
-    """Makes a request to a free model via the OpenRouter API."""
+async def call_llm(prompt: str, model: str, temperature: float = 0.3) -> str:
+    """Makes a request to a specific model via the OpenRouter API."""
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is not set.")
-    
+
     # The OpenAI library is used to connect to OpenRouter's compatible API
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
-    
+
     async with llm_rate_limiter:
         try:
             response = await client.chat.completions.create(
-                model=OPENROUTER_MODEL,
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
                 stream=False,
                 extra_headers={
-                    "HTTP-Referer": APP_URL, 
+                    "HTTP-Referer": APP_URL,
                     "X-Title": APP_TITLE,
                 }
             )
@@ -155,7 +155,7 @@ async def call_llm(prompt: str, temperature: float = 0.3) -> str:
                 raise ValueError("No answer returned from LLM")
             return answer
         except Exception as e:
-            print(f"[OpenRouter] Error calling LLM: {e}")
+            print(f"[OpenRouter] Error calling LLM ({model}): {e}")
             raise
 
 # --- Research Functions ---
@@ -265,13 +265,18 @@ async def get_binary_gpt_prediction(question_details: dict, num_runs: int) -> tu
         summary_report=summary_report,
     )
 
-    async def get_rationale_and_probability(prompt: str) -> tuple[float, str]:
-        rationale = await call_llm(prompt)
+    async def get_rationale_and_probability(prompt: str, model: str) -> tuple[float, str]:
+        rationale = await call_llm(prompt, model=model)
         probability = extract_probability_from_response_as_percentage_not_decimal(rationale)
-        comment = f"Extracted Probability: {probability}%\n\nLLM's Answer:\n{rationale}"
+        comment = f"Model: {model}\nExtracted Probability: {probability}%\n\nLLM's Answer:\n{rationale}"
         return probability, comment
 
-    tasks = [get_rationale_and_probability(content) for _ in range(num_runs)]
+    # Create tasks, cycling through the specified models
+    tasks = []
+    for i in range(num_runs):
+        model_to_use = OPENROUTER_MODELS[i % len(OPENROUTER_MODELS)]
+        tasks.append(get_rationale_and_probability(content, model_to_use))
+        
     results = await asyncio.gather(*tasks)
     
     probabilities = [r[0] for r in results]
@@ -279,7 +284,7 @@ async def get_binary_gpt_prediction(question_details: dict, num_runs: int) -> tu
     
     median_probability = float(np.median(probabilities)) / 100
     
-    final_comment_sections = [f"## Rationale {i+1}\n{c}" for i, c in enumerate(comments)]
+    final_comment_sections = [f"## Run {i+1}\n{c}" for i, c in enumerate(comments)]
     final_comment = f"Median Probability: {median_probability*100:.1f}%\n\n" + "\n\n".join(final_comment_sections)
     
     return median_probability, final_comment
@@ -361,4 +366,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
