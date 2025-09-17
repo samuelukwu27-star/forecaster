@@ -6,6 +6,7 @@ import datetime
 import json
 import os
 import re
+import traceback
 import uuid
 
 import dotenv
@@ -311,31 +312,37 @@ async def forecast_individual_question(
 
     summary = f"-----------------------------------------------\nQuestion: {title}\nURL: https://www.metaculus.com/questions/{post_id}/\n"
 
-    if skip_previously_forecasted_questions and forecast_is_already_made(post_details):
-        summary += "Skipped: Forecast already made\n"
-        print(summary)
-        return summary
+    try:
+        if skip_previously_forecasted_questions and forecast_is_already_made(post_details):
+            summary += "Skipped: Forecast already made\n"
+            print(summary)
+            return summary
 
-    if question_type == "binary":
-        forecast, comment = await get_binary_gpt_prediction(question_details, num_runs_per_question)
-    else:
-        summary += f"Skipped: Question type '{question_type}' is not yet supported.\n"
-        print(summary)
-        return summary
+        if question_type == "binary":
+            forecast, comment = await get_binary_gpt_prediction(question_details, num_runs_per_question)
+        else:
+            summary += f"Skipped: Question type '{question_type}' is not yet supported.\n"
+            print(summary)
+            return summary
 
-    summary += f"Forecast: {forecast}\nComment:\n{comment[:200]}...\n"
-    
-    if submit_prediction:
-        try:
-            payload = create_forecast_payload(forecast, question_type)
-            post_question_prediction(question_id, payload)
-            post_question_comment(post_id, comment)
-            summary += "SUCCESS: Prediction and comment submitted.\n"
-        except Exception as e:
-            summary += f"ERROR: Failed to submit prediction. {e}\n"
-    else:
-        summary += "SKIPPED SUBMISSION: SUBMIT_PREDICTION is False.\n"
+        summary += f"Forecast: {forecast}\nComment:\n{comment[:200]}...\n"
         
+        if submit_prediction:
+            try:
+                payload = create_forecast_payload(forecast, question_type)
+                post_question_prediction(question_id, payload)
+                post_question_comment(post_id, comment)
+                summary += "SUCCESS: Prediction and comment submitted.\n"
+            except Exception as e:
+                summary += f"ERROR: Failed to submit prediction. {e}\n"
+        else:
+            summary += "SKIPPED SUBMISSION: SUBMIT_PREDICTION is False.\n"
+    
+    except Exception as e:
+        summary += f"\n!!!!!!\nCRITICAL ERROR processing question: {title}\n{e}\n!!!!!!\n"
+        # Print the full stack trace for detailed debugging
+        traceback.print_exc()
+
     print(summary)
     return summary
 
@@ -366,3 +373,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
