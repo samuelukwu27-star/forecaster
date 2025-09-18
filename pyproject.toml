@@ -1,18 +1,24 @@
 [tool.poetry]
-name = "ai-forecasting-bots"
+name = "metac-bot-template"
 version = "0.1.0"
-description = "AI forecasting bots based on the Q1 2025 Metaculus Benchmark report."
-authors = ["samuelukwu27@gmail.com"]
+description = ""
+authors = ["samcodes"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.11"
-numpy = "^1.26.4"
-requests = "^2.31.0"
+python-decouple = "^3.8"
+requests = "^2.32.3"
+asknews = "^0.11.2"
+numpy = "^2.3.0"
+openai = "^1.57.4"
 python-dotenv = "^1.0.1"
-beautifulsoup4 = "^4.12.3"
-openai = "^1.23.6"
-forecasting-tools = {git = "https://github.com/Metaculus/forecasting-tools.git"}
+forecasting-tools = "^0.2.54"
+
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
 
 [build-system]
 requires = ["poetry-core"]
