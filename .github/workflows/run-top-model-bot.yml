@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Poetry
         run: |
@@ -38,14 +38,6 @@ jobs:
       - name: Run Top Model Bot
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          METACULUS_API_KEY: ${{ secrets.METACULUS_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           # The SEARCH_PROVIDER_API_KEY is optional if web scraping works reliably
           # SEARCH_PROVIDER_API_KEY: ${{ secrets.SEARCH_PROVIDER_API_KEY }}
-        run: |
-          # Instead of `poetry run`, we find the virtualenv path,
-          # activate it, and then run python directly.
-          # This is a more robust way to ensure the correct paths are used.
-          VENV_PATH=$(poetry env info -p)
-          source $VENV_PATH/bin/activate
-          python main_with_no_framework.py
-
