@@ -55,7 +55,7 @@ APP_TITLE = "Metaculus Forecasting Bot"  # For OpenRouter headers
 
 # --- Tournament & Question IDs ---
 # A list of tournament slugs to process
-TOURNAMENT_IDS = ["fall-aib-2025", "metaculus-cup-fall-2025"]
+TOURNAMENT_IDS = ["fall-aib-2025", "metaculus-cup-fall-2025", "minibench"]
 
 ######################### METACULUS API FUNCTIONS #########################
 
