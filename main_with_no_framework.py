@@ -277,7 +277,6 @@ async def get_multiple_choice_placeholder_prediction(question_details: dict) -> 
 async def forecast_individual_question(question_details: dict) -> str:
     title = question_details["title"]
     question_id = question_details["id"]
-    post_id = question_details["page_id"]
     question_type = question_details["possibilities"]["type"]
     
     summary = f"-----------------------------------------------\nQuestion: {title}\nURL: {question_details['url']}\n"
@@ -304,7 +303,8 @@ async def forecast_individual_question(question_details: dict) -> str:
         if SUBMIT_PREDICTION and forecast is not None:
             payload = create_forecast_payload(forecast, question_type)
             post_question_prediction(question_id, payload)
-            post_question_comment(post_id, comment)
+            # Use the question_id for posting comments, as page_id is not available in APIv2
+            post_question_comment(question_id, comment)
             summary += "SUCCESS: Prediction and comment submitted.\n"
         else:
             summary += "SKIPPED SUBMISSION.\n"
