@@ -16,6 +16,8 @@ python-dotenv = "^1.0.1"
 forecasting-tools = "^0.2.54"
 beautifulsoup4 = "^4.13.5"
 newsapi-python = "^0.2.7"
+tavily-python = "^0.7.12"
+openai = "^1.108.1"
 
 
 [tool.poetry.group.dev.dependencies]
