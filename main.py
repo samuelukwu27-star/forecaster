@@ -27,6 +27,7 @@ from forecasting_tools import (
     structure_output,
 )
 from newsapi import NewsApiClient
+from tavily import TavilyClient
 
 # -----------------------------
 # Environment & API Keys
@@ -34,6 +35,7 @@ from newsapi import NewsApiClient
 METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 # -----------------------------
 # Logging setup
@@ -47,7 +49,7 @@ logger = logging.getLogger("UnifiedForecastBot")
 
 class UnifiedForecastingBot(ForecastBot):
     """
-    This bot integrates custom research functions (web scraping, NewsAPI)
+    This bot integrates custom research functions (web scraping, NewsAPI, Tavily)
     into the robust `forecasting-tools` framework.
     """
 
@@ -59,24 +61,49 @@ class UnifiedForecastingBot(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY) if NEWSAPI_API_KEY else None
+        self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
     # --- Custom Research Implementation ---
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         """
-        Orchestrates research calls using web scraping and NewsAPI.
+        Orchestrates research calls using Tavily, web scraping, and NewsAPI.
         """
         async with self._concurrency_limiter:
             logger.info(f"--- Running Research for: {question.question_text} ---")
             
-            # Run blocking I/O calls in a separate thread to avoid blocking the asyncio event loop
             loop = asyncio.get_running_loop()
-            scrape_results = await loop.run_in_executor(None, self.perform_web_scrape, question.question_text)
-            news_results = await loop.run_in_executor(None, self.call_newsapi, question.question_text)
+            
+            # Run all blocking I/O calls concurrently
+            tasks = [
+                loop.run_in_executor(None, self.call_tavily, question.question_text),
+                loop.run_in_executor(None, self.perform_web_scrape, question.question_text),
+                loop.run_in_executor(None, self.call_newsapi, question.question_text),
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            tavily_results = results[0] if not isinstance(results[0], Exception) else f"Tavily search failed: {results[0]}"
+            scrape_results = results[1] if not isinstance(results[1], Exception) else f"Web scraping failed: {results[1]}"
+            news_results = results[2] if not isinstance(results[2], Exception) else f"NewsAPI search failed: {results[2]}"
 
-            research = f"Web Scrape Summary:\n{scrape_results}\n\nRecent News:\n{news_results}"
+            research = f"{tavily_results}\n\nWeb Scrape Summary:\n{scrape_results}\n\nRecent News:\n{news_results}"
             logger.info(f"--- Research Complete for Q {question.id} ---\n{research[:400]}...\n--------------------")
             return research
+
+    def call_tavily(self, query: str) -> str:
+        """Fetches research from Tavily."""
+        if not self.tavily_client:
+            logger.warning("[Tavily] Tavily API key not set. Skipping Tavily search.")
+            return "Tavily search not performed."
+        try:
+            logger.info(f"[Tavily] Searching for: {query}")
+            # Use search_depth="advanced" for more comprehensive results
+            response = self.tavily_client.search(query=query, search_depth="advanced")
+            # Format the response to be a concise summary
+            context = "\n".join([f"- {obj['content']}" for obj in response.get('results', [])[:3]])
+            return f"Tavily Research Summary:\n{context}"
+        except Exception as e:
+            return f"Tavily search failed: {e}"
 
     def perform_web_scrape(self, query: str) -> str:
         """Performs a web search using DuckDuckGo and scrapes the top result."""
@@ -311,6 +338,8 @@ if __name__ == "__main__":
         llms={
             "default": GeneralLlm(model="openai/gpt-4o", temperature=0.3, timeout=40, allowed_tries=2),
             "parser": GeneralLlm(model="openai/gpt-4o-mini"),
+            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"),
+            "researcher": GeneralLlm(model="openrouter/openai/gpt-4o-search-preview"),
         },
     )
 
