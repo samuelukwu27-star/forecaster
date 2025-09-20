@@ -277,12 +277,11 @@ async def get_multiple_choice_placeholder_prediction(question_details: dict) -> 
 async def forecast_individual_question(question_details: dict) -> str:
     title = question_details["title"]
     question_id = question_details["id"]
-    # Safely access the 'possibilities' key and then the 'type' key.
-    # If 'possibilities' doesn't exist, it will default to an empty dict,
-    # and .get("type") on an empty dict will return None, preventing a crash.
     question_type = question_details.get("possibilities", {}).get("type")
     
-    summary = f"-----------------------------------------------\nQuestion: {title}\nURL: {question_details['url']}\n"
+    # Safely get the URL for logging, providing a default if it's missing.
+    url = question_details.get("url", "No URL found")
+    summary = f"-----------------------------------------------\nQuestion: {title}\nURL: {url}\n"
 
     try:
         if SKIP_PREVIOUSLY_FORECASTED_QUESTIONS and forecast_is_already_made(question_details):
@@ -343,5 +342,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
