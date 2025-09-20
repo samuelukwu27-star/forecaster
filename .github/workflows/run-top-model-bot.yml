@@ -1,4 +1,4 @@
-name: Forecast on new AI tournament questions
+name: mainForecast on new AI tournament questions
 
 on:
   workflow_dispatch:
