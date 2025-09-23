@@ -31,7 +31,6 @@ from tavily import TavilyClient
 # -----------------------------
 # Environment & API Keys
 # -----------------------------
-# Ensure API keys are loaded for the clients that need them directly.
 NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
@@ -55,9 +54,20 @@ class UnifiedForecastingBot(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
+    @property
+    def _llm_config_defaults(self) -> dict[str, str]:
+        # FIX: Register custom forecaster roles to suppress warnings.
+        # This informs the library about our custom LLM purposes.
+        defaults = super()._llm_config_defaults
+        defaults.update({
+            "forecaster_1": "openai/gpt-4o-mini",
+            "forecaster_2": "perplexity/llama-3-sonar-large-32k-online",
+            "forecaster_3": "anthropic/claude-3-haiku-20240307",
+        })
+        return defaults
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # FIX: Access API keys using os.getenv, not self.secrets
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.forecaster_keys = ["forecaster_1", "forecaster_2", "forecaster_3"]
@@ -243,13 +253,11 @@ class UnifiedForecastingBot(ForecastBot):
         if not valid_preds:
             raise ValueError("All model predictions failed parsing.")
 
-        # Average probabilities across all model outputs
         avg_probs = {}
         for option in question.options:
             option_probs = [p.get_prob(option) for p in valid_preds]
             avg_probs[option] = np.mean(option_probs)
         
-        # Normalize to ensure it sums to 1
         total_prob = sum(avg_probs.values())
         final_probs = {option: prob / total_prob for option, prob in avg_probs.items()}
 
@@ -297,7 +305,6 @@ class UnifiedForecastingBot(ForecastBot):
         if not valid_preds:
             raise ValueError("All model predictions failed parsing.")
         
-        # Take the median for each percentile level
         median_percentiles = []
         percentile_levels = sorted({p.percentile for pred_list in valid_preds for p in pred_list})
 
@@ -328,6 +335,11 @@ if __name__ == "__main__":
         "--mode", type=str, choices=["tournament", "test_questions"],
         default="tournament", help="Specify the run mode.",
     )
+    # FIX: Add argument to accept custom tournament IDs, giving you control.
+    parser.add_argument(
+        "--tournament-ids", nargs='+', type=str,
+        help="One or more tournament IDs or slugs to forecast on (e.g., 32813 metaculus-cup)."
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "test_questions"] = args.mode
 
@@ -337,11 +349,9 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         llms={
-            # FIX: Add standard roles to remove warnings
             "default": GeneralLlm(model="openai/gpt-4o-mini"),
             "summarizer": GeneralLlm(model="openai/gpt-4o-mini"),
-            "researcher": None, # Using custom research, so not needed
-            # Forecasters for multi-model strategy
+            "researcher": None, 
             "forecaster_1": GeneralLlm(model="openai/gpt-4o-mini", temperature=0.3),
             "forecaster_2": GeneralLlm(model="perplexity/llama-3-sonar-large-32k-online", temperature=0.3),
             "forecaster_3": GeneralLlm(model="anthropic/claude-3-haiku-20240307", temperature=0.3),
@@ -353,24 +363,29 @@ if __name__ == "__main__":
     try:
         if run_mode == "tournament":
             logger.info("Running in tournament mode...")
-            seasonal_reports = asyncio.run(
-                unified_bot.forecast_on_tournament(
-                    MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+            # Use provided IDs if available, otherwise fall back to library defaults.
+            tournament_ids_to_run = args.tournament_ids or [
+                MetaculusApi.CURRENT_AI_COMPETITION_ID,
+                MetaculusApi.CURRENT_MINIBENCH_ID
+            ]
+            logger.info(f"Targeting tournaments: {tournament_ids_to_run}")
+
+            all_reports = []
+            for tournament_id in tournament_ids_to_run:
+                reports = asyncio.run(
+                    unified_bot.forecast_on_tournament(
+                        tournament_id, return_exceptions=True
+                    )
                 )
-            )
-            minibench_reports = asyncio.run(
-                unified_bot.forecast_on_tournament(
-                    MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True
-                )
-            )
-            forecast_reports = seasonal_reports + minibench_reports
+                all_reports.extend(reports)
+            forecast_reports = all_reports
 
         elif run_mode == "test_questions":
             logger.info("Running in test questions mode...")
             EXAMPLE_QUESTIONS = [
-                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Binary
-                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Numeric
-                "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Multiple Choice
+                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+                "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
             ]
             questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
             forecast_reports = asyncio.run(
