@@ -335,7 +335,6 @@ if __name__ == "__main__":
         "--mode", type=str, choices=["tournament", "test_questions"],
         default="tournament", help="Specify the run mode.",
     )
-    # FIX: Add argument to accept custom tournament IDs, giving you control.
     parser.add_argument(
         "--tournament-ids", nargs='+', type=str,
         help="One or more tournament IDs or slugs to forecast on (e.g., 32813 metaculus-cup)."
@@ -363,7 +362,6 @@ if __name__ == "__main__":
     try:
         if run_mode == "tournament":
             logger.info("Running in tournament mode...")
-            # Use provided IDs if available, otherwise fall back to library defaults.
             tournament_ids_to_run = args.tournament_ids or [
                 MetaculusApi.CURRENT_AI_COMPETITION_ID,
                 MetaculusApi.CURRENT_MINIBENCH_ID
