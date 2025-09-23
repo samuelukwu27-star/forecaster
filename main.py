@@ -1,7 +1,5 @@
 # A forecasting bot combining a structured framework with custom research tools    async def run_research(self, question: MetaculusQuestion) -> str:
-        """
-        Orchestrates research calls using web scraping, NewsAPI, and Tavily.
-        """
+
         async with self._concurrency_limiter:
             logger.info(f"--- Running Research for: {question.question_text} ---")
 
