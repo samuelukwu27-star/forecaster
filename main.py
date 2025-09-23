@@ -29,6 +29,13 @@ from newsapi import NewsApiClient
 from tavily import TavilyClient
 
 # -----------------------------
+# Environment & API Keys
+# -----------------------------
+# Ensure API keys are loaded for the clients that need them directly.
+NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+# -----------------------------
 # Logging setup
 # -----------------------------
 logging.basicConfig(
@@ -50,8 +57,9 @@ class UnifiedForecastingBot(ForecastBot):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.newsapi_client = NewsApiClient(api_key=self.secrets.get("NEWSAPI_API_KEY"))
-        self.tavily_client = TavilyClient(api_key=self.secrets.get("TAVILY_API_KEY"))
+        # FIX: Access API keys using os.getenv, not self.secrets
+        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
+        self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.forecaster_keys = ["forecaster_1", "forecaster_2", "forecaster_3"]
 
     # --- Custom Research Implementation ---
@@ -325,11 +333,15 @@ if __name__ == "__main__":
 
     unified_bot = UnifiedForecastingBot(
         research_reports_per_question=1,
-        # Set to 1 as we now query multiple models inside each forecast run
         predictions_per_research_report=1, 
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         llms={
+            # FIX: Add standard roles to remove warnings
+            "default": GeneralLlm(model="openai/gpt-4o-mini"),
+            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"),
+            "researcher": None, # Using custom research, so not needed
+            # Forecasters for multi-model strategy
             "forecaster_1": GeneralLlm(model="openai/gpt-4o-mini", temperature=0.3),
             "forecaster_2": GeneralLlm(model="perplexity/llama-3-sonar-large-32k-online", temperature=0.3),
             "forecaster_3": GeneralLlm(model="anthropic/claude-3-haiku-20240307", temperature=0.3),
