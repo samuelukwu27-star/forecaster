@@ -54,11 +54,12 @@ class UnifiedForecastingBot(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
-    @property
+    # FIX: Change from @property to a regular method as expected by the framework.
     def _llm_config_defaults(self) -> dict[str, str]:
-        # FIX: Register custom forecaster roles to suppress warnings.
-        # This informs the library about our custom LLM purposes.
-        defaults = super()._llm_config_defaults
+        """
+        Registers custom forecaster roles to suppress warnings.
+        """
+        defaults = super()._llm_config_defaults() # Call the parent method
         defaults.update({
             "forecaster_1": "openai/gpt-4o-mini",
             "forecaster_2": "perplexity/llama-3-sonar-large-32k-online",
