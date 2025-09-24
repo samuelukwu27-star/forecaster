@@ -78,7 +78,6 @@ class CommitteeForecastingBot(ForecastBot):
         super().__init__(*args, **kwargs)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-        # FIX: The attribute in the parent class is `_llms`, not `llms`.
         self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
         if not self.synthesizer_keys:
             raise ValueError("No synthesizer models found. Define at least one 'synthesizer_1'.")
@@ -216,7 +215,6 @@ class CommitteeForecastingBot(ForecastBot):
         valid_preds = [p for p in predictions if p]
         if not valid_preds: raise ValueError("All numeric synthesizer predictions failed parsing.")
 
-        # Aggregate by taking the median of each percentile across the committee
         p25 = np.median([p.p25 for p in valid_preds])
         p50 = np.median([p.p50 for p in valid_preds])
         p75 = np.median([p.p75 for p in valid_preds])
@@ -251,15 +249,9 @@ class CommitteeForecastingBot(ForecastBot):
         valid_preds = [p.as_dict for p in predictions if p]
         if not valid_preds: raise ValueError("All multi-choice synthesizer predictions failed parsing.")
 
-        # Aggregate by averaging probabilities for each option across the committee
-        avg_probs = {}
-        for option in question.options:
-            avg_probs[option] = np.mean([pred[option] for pred in valid_preds])
-
-        # Normalize to ensure the final sum is exactly 1.0
+        avg_probs = {option: np.mean([pred[option] for pred in valid_preds]) for option in question.options}
         total_prob = sum(avg_probs.values())
         final_probs = {option: prob / total_prob for option, prob in avg_probs.items()}
-
         final_pred = PredictedOptionList(list(final_probs.items()))
         comment = self._format_comment("Multi-Option Analysis", {"Analyst": analyst_arg})
 
@@ -275,7 +267,7 @@ class CommitteeForecastingBot(ForecastBot):
         for res in results:
             if isinstance(res, Exception):
                 logger.error(f"Synthesizer failed: {res}")
-                parsing_tasks.append(asyncio.sleep(0, result=None)) # Add a placeholder for failed tasks
+                parsing_tasks.append(asyncio.sleep(0, result=None))
                 continue
             
             if output_type == PredictedOptionList:
@@ -290,11 +282,11 @@ class CommitteeForecastingBot(ForecastBot):
         comment = f"--- {stage_name.upper()} STAGE ---\n\n"
         for agent_name, reasoning in args.items():
             model_key = agent_name.lower().replace(" ", "_")
-            model_id = getattr(self.llms.get(model_key), 'model', 'unknown-model')
+            model_id = getattr(self.get_llm(model_key, 'llm'), 'model', 'unknown-model')
             comment += f"--- Argument from {agent_name} Agent ({model_id}) ---\n\n{reasoning}\n\n"
         return comment
 
-if __name__ == "__main__":
+async def main():
     parser = argparse.ArgumentParser(description="Run the CommitteeForecastingBot.")
     parser.add_argument("--mode", type=str, choices=["tournament", "test_questions"], default="tournament")
     parser.add_argument("--tournament-ids", nargs='+', type=str)
@@ -307,34 +299,32 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         llms={
             "default": GeneralLlm(model="openai/gpt-4o-mini"),
-            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"), # FIX: Explicitly define summarizer
+            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"),
             "researcher": GeneralLlm(model="openai/gpt-4o", temperature=0.1),
             "parser": GeneralLlm(model="openai/gpt-4o"),
-
-            # Binary Debate Agents
             "proponent": GeneralLlm(model="openai/gpt-4o", temperature=0.4),
             "opponent": GeneralLlm(model="openai/gpt-4-turbo", temperature=0.4),
-
-            # Numeric Analysis Agents
             "analyst_low": GeneralLlm(model="openai/gpt-4o", temperature=0.4),
             "analyst_high": GeneralLlm(model="openai/gpt-4-turbo", temperature=0.4),
-
-            # Multiple Choice Analysis Agent
             "analyst_mc": GeneralLlm(model="openai/gpt-4o", temperature=0.3),
-
-            # Committee Synthesizers
             "synthesizer_1": GeneralLlm(model="openai/gpt-4o", temperature=0.2),
             "synthesizer_2": GeneralLlm(model="openai/gpt-4-turbo", temperature=0.2),
             "synthesizer_3": GeneralLlm(model="openai/gpt-4o", temperature=0.2),
         },
     )
 
+    forecast_reports = []
     try:
         if args.mode == "tournament":
             logger.info("Running in tournament mode...")
             ids = args.tournament_ids or [MetaculusApi.CURRENT_AI_COMPETITION_ID]
             logger.info(f"Targeting tournaments: {ids}")
-            reports = asyncio.run(committee_bot.forecast_on_tournaments(ids, return_exceptions=True))
+            # FIX: Loop through each tournament ID and call the singular method
+            all_reports = []
+            for tournament_id in ids:
+                reports = await committee_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
+                all_reports.extend(reports)
+            forecast_reports = all_reports
         else: # test_questions
             logger.info("Running in test questions mode...")
             URLS = [
@@ -343,11 +333,14 @@ if __name__ == "__main__":
                 "https://www.metaculus.com/questions/2618/cause-of-next-human-extinction-event/" # Multiple Choice
             ]
             questions = [MetaculusApi.get_question_by_url(url) for url in URLS]
-            reports = asyncio.run(committee_bot.forecast_questions(questions, return_exceptions=True))
+            forecast_reports = await committee_bot.forecast_questions(questions, return_exceptions=True)
 
-        committee_bot.log_report_summary(reports)
+        committee_bot.log_report_summary(forecast_reports)
         logger.info("Run finished successfully.")
     except Exception as e:
         logger.error(f"Run failed with a critical error: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
