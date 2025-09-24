@@ -60,17 +60,19 @@ class CommitteeForecastingBot(ForecastBot):
     def _llm_config_defaults(self) -> dict[str, str]:
         """
         Registers custom agent roles to suppress warnings and provide sane defaults.
+        All models are explicitly routed through OpenRouter.
         """
         defaults = super()._llm_config_defaults()
+        # FIX: Prepend "openrouter/" to all model names to force routing
         defaults.update({
-            "proponent": "openai/gpt-4o",
-            "opponent": "openai/gpt-4-turbo",
-            "analyst_low": "openai/gpt-4o",
-            "analyst_high": "openai/gpt-4-turbo",
-            "analyst_mc": "openai/gpt-4o",
-            "synthesizer_1": "openai/gpt-4o",
-            "synthesizer_2": "openai/gpt-4-turbo",
-            "synthesizer_3": "openai/gpt-4o",
+            "proponent": "openrouter/openai/gpt-4o",
+            "opponent": "openrouter/openai/gpt-4-turbo",
+            "analyst_low": "openrouter/openai/gpt-4o",
+            "analyst_high": "openrouter/openai/gpt-4-turbo",
+            "analyst_mc": "openrouter/openai/gpt-4o",
+            "synthesizer_1": "openrouter/openai/gpt-4o",
+            "synthesizer_2": "openrouter/openai/gpt-4-turbo",
+            "synthesizer_3": "openrouter/openai/gpt-4o",
         })
         return defaults
 
@@ -99,7 +101,7 @@ class CommitteeForecastingBot(ForecastBot):
             urls_to_scrape = []
             if isinstance(tavily_response, dict):
                 tavily_summary = "\n".join([f"- {c['content']}" for c in tavily_response.get('results', [])])
-                urls_to_scrape = [c['url'] for c in tavily_response.get('results', [])][:3] # Scrape top 3
+                urls_to_scrape = [c['url'] for c in tavily_response.get('results', [])][:3]
 
             scraped_data = ""
             if urls_to_scrape:
@@ -298,18 +300,19 @@ async def main():
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         llms={
-            "default": GeneralLlm(model="openai/gpt-4o-mini"),
-            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"),
-            "researcher": GeneralLlm(model="openai/gpt-4o", temperature=0.1),
-            "parser": GeneralLlm(model="openai/gpt-4o"),
-            "proponent": GeneralLlm(model="openai/gpt-4o", temperature=0.4),
-            "opponent": GeneralLlm(model="openai/gpt-4-turbo", temperature=0.4),
-            "analyst_low": GeneralLlm(model="openai/gpt-4o", temperature=0.4),
-            "analyst_high": GeneralLlm(model="openai/gpt-4-turbo", temperature=0.4),
-            "analyst_mc": GeneralLlm(model="openai/gpt-4o", temperature=0.3),
-            "synthesizer_1": GeneralLlm(model="openai/gpt-4o", temperature=0.2),
-            "synthesizer_2": GeneralLlm(model="openai/gpt-4-turbo", temperature=0.2),
-            "synthesizer_3": GeneralLlm(model="openai/gpt-4o", temperature=0.2),
+            # FIX: Prepend "openrouter/" to all model names to force routing
+            "default": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
+            "summarizer": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
+            "researcher": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
+            "parser": GeneralLlm(model="openrouter/openai/gpt-4o"),
+            "proponent": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.4),
+            "opponent": GeneralLlm(model="openrouter/openai/gpt-4-turbo", temperature=0.4),
+            "analyst_low": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.4),
+            "analyst_high": GeneralLlm(model="openrouter/openai/gpt-4-turbo", temperature=0.4),
+            "analyst_mc": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.3),
+            "synthesizer_1": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.2),
+            "synthesizer_2": GeneralLlm(model="openrouter/openai/gpt-4-turbo", temperature=0.2),
+            "synthesizer_3": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.2),
         },
     )
 
@@ -319,7 +322,6 @@ async def main():
             logger.info("Running in tournament mode...")
             ids = args.tournament_ids or [MetaculusApi.CURRENT_AI_COMPETITION_ID]
             logger.info(f"Targeting tournaments: {ids}")
-            # FIX: Loop through each tournament ID and call the singular method
             all_reports = []
             for tournament_id in ids:
                 reports = await committee_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
