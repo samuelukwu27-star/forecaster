@@ -63,7 +63,6 @@ class CommitteeForecastingBot(ForecastBot):
         All models are explicitly routed through OpenRouter.
         """
         defaults = super()._llm_config_defaults()
-        # FIX: Prepend "openrouter/" to all model names to force routing
         defaults.update({
             "proponent": "openrouter/openai/gpt-4o",
             "opponent": "openrouter/openai/gpt-4-turbo",
@@ -300,7 +299,6 @@ async def main():
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         llms={
-            # FIX: Prepend "openrouter/" to all model names to force routing
             "default": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
             "summarizer": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
             "researcher": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
@@ -320,7 +318,8 @@ async def main():
     try:
         if args.mode == "tournament":
             logger.info("Running in tournament mode...")
-            ids = args.tournament_ids or [MetaculusApi.CURRENT_AI_COMPETITION_ID]
+            # FIX: Updated the default list of tournament IDs to the user's specification.
+            ids = args.tournament_ids or ["market-pulse-25q3", "fiscal", "metaculus-cup-fall-2025", "minibench"]
             logger.info(f"Targeting tournaments: {ids}")
             all_reports = []
             for tournament_id in ids:
