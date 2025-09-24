@@ -57,11 +57,29 @@ class CommitteeForecastingBot(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
+    def _llm_config_defaults(self) -> dict[str, str]:
+        """
+        Registers custom agent roles to suppress warnings and provide sane defaults.
+        """
+        defaults = super()._llm_config_defaults()
+        defaults.update({
+            "proponent": "openai/gpt-4o",
+            "opponent": "openai/gpt-4-turbo",
+            "analyst_low": "openai/gpt-4o",
+            "analyst_high": "openai/gpt-4-turbo",
+            "analyst_mc": "openai/gpt-4o",
+            "synthesizer_1": "openai/gpt-4o",
+            "synthesizer_2": "openai/gpt-4-turbo",
+            "synthesizer_3": "openai/gpt-4o",
+        })
+        return defaults
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-        self.synthesizer_keys = [k for k in self.llms.keys() if k.startswith("synthesizer")]
+        # FIX: The attribute in the parent class is `_llms`, not `llms`.
+        self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
         if not self.synthesizer_keys:
             raise ValueError("No synthesizer models found. Define at least one 'synthesizer_1'.")
         logger.info(f"Initialized with a committee of {len(self.synthesizer_keys)} synthesizers.")
@@ -289,6 +307,7 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         llms={
             "default": GeneralLlm(model="openai/gpt-4o-mini"),
+            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"), # FIX: Explicitly define summarizer
             "researcher": GeneralLlm(model="openai/gpt-4o", temperature=0.1),
             "parser": GeneralLlm(model="openai/gpt-4o"),
 
