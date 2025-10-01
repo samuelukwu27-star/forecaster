@@ -302,7 +302,7 @@ async def main():
             "default": GeneralLlm(model="openrouter/openai/gpt-5-nano"),
             "summarizer": GeneralLlm(model="openrouter/openai/gpt-o4-mini"),
             "researcher": GeneralLlm(model="openrouter/openai/gpt-4.1", temperature=0.1),
-            "parser": GeneralLlm(model="openrouter/openai/gpt-4.5-preview"),
+            "parser": GeneralLlm(model="openrouter/openai/gpt-o3"),
             "proponent": GeneralLlm(model="openrouter/openai/gpt-o4-mini", temperature=0.4),
             "opponent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.4),
             "analyst_low": GeneralLlm(model="openrouter/openai/gpt-oss-120b", temperature=0.4),
@@ -319,7 +319,7 @@ async def main():
         if args.mode == "tournament":
             logger.info("Running in tournament mode...")
             # FIX: Updated the default list of tournament IDs to the user's specification.
-            ids = args.tournament_ids or ["market-pulse-25q3", "32813", "minibench"]
+            ids = args.tournament_ids or ["market-pulse-25q4", "32813", "minibench"]
             logger.info(f"Targeting tournaments: {ids}")
             all_reports = []
             for tournament_id in ids:
