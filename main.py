@@ -67,10 +67,10 @@ class CommitteeForecastingBot(ForecastBot):
             "proponent": "openrouter/openai/gpt-4.1-nano",
             "opponent": "openrouter/openai/gpt-5",
             "analyst_low": "openrouter/openai/gpt-4.1-mini",
-            "analyst_high": "openrouter/openai/gpt-5-nano",
+            "analyst_high": "openrouter/openai/gpt-4o",
             "analyst_mc": "openrouter/gpt-5",
             "synthesizer_1": "openrouter/openai/gpt-5-nano",
-            "synthesizer_2": "openrouter/openai/gpt-5-mini",
+            "synthesizer_2": "openrouter/openai/gpt-5",
             "synthesizer_3": "openrouter/openai/gpt-4o",
         })
         return defaults
@@ -301,7 +301,7 @@ async def main():
         llms={
             "default": GeneralLlm(model="openrouter/openai/gpt-5-nano"),
             "summarizer": GeneralLlm(model="openrouter/openai/gpt-5"),
-            "researcher": GeneralLlm(model="openrouter/openai/gpt-5-mini", temperature=0.1),
+            "researcher": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
             "parser": GeneralLlm(model="openrouter/openai/gpt-4o-mini-search-preview"),
             "proponent": GeneralLlm(model="openrouter/openai/gpt-4.1-nano", temperature=0.4),
             "opponent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.4),
@@ -309,7 +309,7 @@ async def main():
             "analyst_high": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.4),
             "analyst_mc": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.3),
             "synthesizer_1": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.2),
-            "synthesizer_2": GeneralLlm(model="openrouter/openai/openai/gpt-5-mini", temperature=0.2),
+            "synthesizer_2": GeneralLlm(model="openrouter/openai/openai/gpt-5", temperature=0.2),
             "synthesizer_3": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.2),
         },
     )
