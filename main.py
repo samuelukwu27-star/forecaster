@@ -64,7 +64,7 @@ class CommitteeForecastingBot(ForecastBot):
         """
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "proponent": "openrouter/openai/o3",
+            "proponent": "openrouter/openai/gpt-4.1-nano",
             "opponent": "openrouter/openai/gpt-5",
             "analyst_low": "openrouter/openai/gpt-4.1-mini",
             "analyst_high": "openrouter/openai/gpt-5-nano",
@@ -302,8 +302,8 @@ async def main():
             "default": GeneralLlm(model="openrouter/openai/gpt-5-nano"),
             "summarizer": GeneralLlm(model="openrouter/openai/gpt-5"),
             "researcher": GeneralLlm(model="openrouter/openai/gpt-5-mini", temperature=0.1),
-            "parser": GeneralLlm(model="openrouter/openai/gpt-o3"),
-            "proponent": GeneralLlm(model="openrouter/openai/gpt-o3", temperature=0.4),
+            "parser": GeneralLlm(model="openrouter/openai/gpt-4o-mini-search-preview"),
+            "proponent": GeneralLlm(model="openrouter/openai/gpt-4.1-nano", temperature=0.4),
             "opponent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.4),
             "analyst_low": GeneralLlm(model="openrouter/openai/gpt-4.1-mini", temperature=0.4),
             "analyst_high": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.4),
