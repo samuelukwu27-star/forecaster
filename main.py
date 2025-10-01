@@ -64,13 +64,13 @@ class CommitteeForecastingBot(ForecastBot):
         """
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "proponent": "openrouter/openai/gpt-4o",
-            "opponent": "openrouter/openai/gpt-4-turbo",
-            "analyst_low": "openrouter/openai/gpt-4o",
-            "analyst_high": "openrouter/openai/gpt-4-turbo",
+            "proponent": "openrouter/openai/o4-mini",
+            "opponent": "openrouter/openai/gpt-5",
+            "analyst_low": "openrouter/openai/gpt-oss-120b",
+            "analyst_high": "openrouter/openai/gpt-5-nano",
             "analyst_mc": "openrouter/openai/gpt-4o",
-            "synthesizer_1": "openrouter/openai/gpt-4o",
-            "synthesizer_2": "openrouter/openai/gpt-4-turbo",
+            "synthesizer_1": "openrouter/openai/gpt-5-nano",
+            "synthesizer_2": "openrouter/openai/gpt-5-mini",
             "synthesizer_3": "openrouter/openai/gpt-4o",
         })
         return defaults
@@ -299,17 +299,17 @@ async def main():
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         llms={
-            "default": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
-            "summarizer": GeneralLlm(model="openrouter/openai/gpt-4o-mini"),
-            "researcher": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
-            "parser": GeneralLlm(model="openrouter/openai/gpt-4o"),
-            "proponent": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.4),
-            "opponent": GeneralLlm(model="openrouter/openai/gpt-4-turbo", temperature=0.4),
-            "analyst_low": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.4),
-            "analyst_high": GeneralLlm(model="openrouter/openai/gpt-4-turbo", temperature=0.4),
+            "default": GeneralLlm(model="openrouter/openai/gpt-5-nano"),
+            "summarizer": GeneralLlm(model="openrouter/openai/gpt-o4-mini"),
+            "researcher": GeneralLlm(model="openrouter/openai/gpt-4.1", temperature=0.1),
+            "parser": GeneralLlm(model="openrouter/openai/gpt-4.5-preview"),
+            "proponent": GeneralLlm(model="openrouter/openai/gpt-o4-mini", temperature=0.4),
+            "opponent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.4),
+            "analyst_low": GeneralLlm(model="openrouter/openai/gpt-oss-120b", temperature=0.4),
+            "analyst_high": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.4),
             "analyst_mc": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.3),
-            "synthesizer_1": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.2),
-            "synthesizer_2": GeneralLlm(model="openrouter/openai/gpt-4-turbo", temperature=0.2),
+            "synthesizer_1": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.2),
+            "synthesizer_2": GeneralLlm(model="openrouter/openai/openai/gpt-5-mini", temperature=0.2),
             "synthesizer_3": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.2),
         },
     )
@@ -319,7 +319,7 @@ async def main():
         if args.mode == "tournament":
             logger.info("Running in tournament mode...")
             # FIX: Updated the default list of tournament IDs to the user's specification.
-            ids = args.tournament_ids or ["market-pulse-25q3", "fiscal", "metaculus-cup-fall-2025", "minibench"]
+            ids = args.tournament_ids or ["market-pulse-25q3", "32813", "minibench"]
             logger.info(f"Targeting tournaments: {ids}")
             all_reports = []
             for tournament_id in ids:
