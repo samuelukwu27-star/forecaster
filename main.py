@@ -1,18 +1,12 @@
 import argparse
 import asyncio
 import logging
-import os
-import re
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Any
 
 import numpy as np
-import requests
-from bs4 import BeautifulSoup
 from forecasting_tools import (
     AskNewsSearcher,
-    SmartSearcher,
-    BinaryPrediction,
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
@@ -22,13 +16,16 @@ from forecasting_tools import (
     NumericDistribution,
     NumericQuestion,
     Percentile,
+    BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
+    SmartSearcher,
     clean_indents,
     structure_output,
 )
 from newsapi import NewsApiClient
 from tavily import TavilyClient
+import os
 
 # -----------------------------
 # Environment & API Keys
@@ -36,312 +33,338 @@ from tavily import TavilyClient
 NEWSAPI_API_KEY = os.getenv("NEWSAPI_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-# -----------------------------
-# Logging setup
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("CommitteeForecastBot")
+logger = logging.getLogger(__name__)
 
 
-class CommitteeForecastingBot(ForecastBot):
+class AdaptiveCommitteeBot2025(ForecastBot):
     """
-    This bot uses a committee of independent synthesizer models to forecast on
-    binary, numeric, and multiple-choice questions. The reasoning structure is
-    adapted for each question type (e.g., proponent/opponent for binary,
-    high/low analysts for numeric).
+    An adaptive forecasting bot that routes questions to specialized agent committees
+    based on question type and uncertainty. Uses debate for binary, scenario generation
+    for numeric, and domain analysts for MCQs. Final prediction is synthesized by a
+    diverse committee of 3+ models to reduce bias.
     """
 
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-
-    def _llm_config_defaults(self) -> dict[str, str]:
-        """
-        Registers custom agent roles to suppress warnings and provide sane defaults.
-        All models are explicitly routed through OpenRouter.
-        """
-        defaults = super()._llm_config_defaults()
-        defaults.update({
-            "proponent": "openrouter/openai/gpt-4.1-nano",
-            "opponent": "openrouter/openai/gpt-5",
-            "analyst_low": "openrouter/openai/gpt-4.1-mini",
-            "analyst_high": "openrouter/openai/gpt-4o",
-            "analyst_mc": "openrouter/gpt-5",
-            "synthesizer_1": "openrouter/openai/gpt-5-nano",
-            "synthesizer_2": "openrouter/openai/gpt-5",
-            "synthesizer_3": "openrouter/openai/gpt-4o",
-        })
-        return defaults
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
         self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
-        if not self.synthesizer_keys:
-            raise ValueError("No synthesizer models found. Define at least one 'synthesizer_1'.")
-        logger.info(f"Initialized with a committee of {len(self.synthesizer_keys)} synthesizers.")
+        if len(self.synthesizer_keys) < 3:
+            raise ValueError("At least 3 synthesizer models required (e.g., synthesizer_1, synthesizer_2, synthesizer_3).")
+        logger.info(f"Initialized with adaptive committee: {len(self.synthesizer_keys)} synthesizers.")
 
-    # --- Research Implementation ---
+    # ======================
+    # RESEARCH LAYER
+    # ======================
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            logger.info(f"--- Running Research for: {question.question_text} ---")
+            # Use Tavily + NewsAPI for broad coverage
             loop = asyncio.get_running_loop()
             tasks = {
-                "tavily": loop.run_in_executor(None, self.call_tavily, question.question_text),
-                "news": loop.run_in_executor(None, self.call_newsapi, question.question_text),
+                "tavily": loop.run_in_executor(None, self._call_tavily, question.question_text),
+                "news": loop.run_in_executor(None, self._call_newsapi, question.question_text),
             }
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            tavily_response, news_results = results
+            tavily_res, news_res = results
 
-            tavily_summary = "Tavily search failed."
-            urls_to_scrape = []
-            if isinstance(tavily_response, dict):
-                tavily_summary = "\n".join([f"- {c['content']}" for c in tavily_response.get('results', [])])
-                urls_to_scrape = [c['url'] for c in tavily_response.get('results', [])][:3]
+            tavily_summary = "Tavily search failed." if isinstance(tavily_res, Exception) else tavily_res
+            news_summary = "NewsAPI failed." if isinstance(news_res, Exception) else news_res
 
-            scraped_data = ""
-            if urls_to_scrape:
-                logger.info(f"Scraping {len(urls_to_scrape)} URLs...")
-                scraped_data = await loop.run_in_executor(None, self.scrape_urls, urls_to_scrape)
+            raw_research = f"Tavily:\n{tavily_summary}\n\nRecent News:\n{news_summary}"
+            return raw_research
 
-            raw_research = (
-                f"Tavily Summary:\n{tavily_summary}\n\nRecent News:\n{news_results}\n\n"
-                f"Web Scraped Content:\n{scraped_data}"
-            )
-
-            logger.info(f"--- Synthesizing Raw Research for: {question.question_text} ---")
-            synthesis_prompt = clean_indents(f"""
-                Analyze the following raw research data. Provide a concise, synthesized summary for a forecaster.
-                Focus on key drivers, potential turning points, and conflicting information.
-                Raw Data:\n{raw_research}\n\nSynthesized Summary:
-            """)
-            synthesized_research = await self.get_llm("researcher", "llm").invoke(synthesis_prompt)
-            logger.info(f"--- Research Complete for Q {question.page_url} ---")
-            return synthesized_research
-
-    def scrape_urls(self, urls: list[str]) -> str:
-        scraped_content = []
-        for url in urls:
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-                response = requests.get(url, timeout=10, headers=headers)
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.content, 'html.parser')
-                    page_text = ' '.join([p.get_text() for p in soup.find_all('p')])
-                    scraped_content.append(f"--- From {url} ---\n{page_text.strip()[:2500]}...")
-                else:
-                    logger.warning(f"Failed to fetch {url}, status: {response.status_code}")
-            except Exception as e:
-                logger.error(f"Failed to scrape {url}: {e}")
-        return "\n\n".join(scraped_content)
-
-    def call_tavily(self, query: str) -> dict | str:
-        if not self.tavily_client.api_key: return "Tavily key not set."
+    def _call_tavily(self, query: str) -> str:
+        if not TAVILY_API_KEY:
+            return "Tavily API key not set."
         try:
-            return self.tavily_client.search(query=query, search_depth="advanced", max_results=5)
+            res = self.tavily_client.search(query=query, search_depth="advanced", max_results=5)
+            return "\n".join([f"- {r['content']}" for r in res.get("results", [])])
         except Exception as e:
-            logger.error(f"Tavily search failed: {e}"); return f"Tavily search failed: {e}"
+            logger.error(f"Tavily error: {e}")
+            return f"Tavily error: {e}"
 
-    def call_newsapi(self, query: str) -> str:
-        if not self.newsapi_client.api_key: return "NewsAPI key not set."
+    def _call_newsapi(self, query: str) -> str:
+        if not NEWSAPI_API_KEY:
+            return "NewsAPI key not set."
         try:
             articles = self.newsapi_client.get_everything(q=query, language='en', sort_by='relevancy', page_size=5)
-            if not articles or not articles.get('articles'): return "No recent news found."
+            if not articles or not articles.get('articles'):
+                return "No recent news found."
             return "\n".join([f"- {a['title']}: {a.get('description', 'N/A')}" for a in articles['articles']])
         except Exception as e:
-            logger.error(f"NewsAPI search failed: {e}"); return f"NewsAPI search failed: {e}"
+            logger.error(f"NewsAPI error: {e}")
+            return f"NewsAPI error: {e}"
 
-    # --- Forecasting Logic ---
-    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        logger.info(f"--- Starting Binary Debate for: {question.page_url} ---")
-        proponent_arg = await self.get_llm("proponent", "llm").invoke(clean_indents(f"""
-            Act as a PROPONENT for a YES outcome. Build the strongest possible case using the research.
-            Question: {question.question_text}, Research: {research}
-        """))
-        opponent_arg = await self.get_llm("opponent", "llm").invoke(clean_indents(f"""
-            Act as an OPPONENT for a NO outcome. Build the strongest possible case using the research.
-            Question: {question.question_text}, Research: {research}
-        """))
+    # ======================
+    # ADAPTIVE FORECASTING
+    # ======================
 
-        synthesizer_prompt = clean_indents(f"""
-            You are a judge on a forecasting committee. Evaluate the competing arguments to arrive at a final probability.
-            Question: "{question.question_text}"
-            Resolution Criteria: {question.resolution_criteria}, Research: {research}
-            --- Proponent's Case for YES ---\n{proponent_arg}\n--- END CASE ---
-            --- Opponent's Case for NO ---\n{opponent_arg}\n--- END CASE ---
-            1. Summarize the strongest point from each side.
-            2. Identify gaps or weaknesses in their arguments.
-            3. Write your final integrated rationale.
-            4. The very last thing you write is your final probability as: "Probability: ZZ%", from 0-100.
+    async def _run_forecast_on_binary(
+        self, question: BinaryQuestion, research: str
+    ) -> ReasonedPrediction[float]:
+        logger.info(f"Launching debate for binary question: {question.page_url}")
+
+        # Proponent & Opponent
+        pro_prompt = clean_indents(f"""
+            Act as a PROPONENT arguing the outcome will be YES.
+            Question: {question.question_text}
+            Resolution Criteria: {question.resolution_criteria}
+            Research: {research}
+            Build the strongest evidence-based case for YES.
+        """)
+        con_prompt = clean_indents(f"""
+            Act as an OPPONENT arguing the outcome will be NO.
+            Question: {question.question_text}
+            Resolution Criteria: {question.resolution_criteria}
+            Research: {research}
+            Build the strongest evidence-based case for NO.
         """)
 
-        predictions = await self._run_committee_and_parse(synthesizer_prompt, BinaryPrediction)
-        valid_preds = [p.prediction_in_decimal for p in predictions if p and hasattr(p, "prediction_in_decimal")]
-        if not valid_preds: raise ValueError("All binary synthesizer predictions failed parsing.")
+        proponent = await self.get_llm("proponent", "llm").invoke(pro_prompt)
+        opponent = await self.get_llm("opponent", "llm").invoke(con_prompt)
+
+        # Synthesis prompt
+        synth_prompt = clean_indents(f"""
+            You are a superforecaster judging a debate.
+            Question: "{question.question_text}"
+            Criteria: {question.resolution_criteria}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            Research: {research}
+            --- PRO (YES) ---
+            {proponent}
+            --- CON (NO) ---
+            {opponent}
+            1. Summarize key evidence from both sides.
+            2. Assess which scenario is more plausible given status quo bias.
+            3. Output final probability as: "Probability: ZZ%"
+        """)
+
+        predictions = await self._run_synthesizers(synth_prompt, BinaryPrediction)
+        valid_preds = [p.prediction_in_decimal for p in predictions if p]
+        if not valid_preds:
+            raise ValueError("All synthesizers failed to produce valid binary prediction.")
 
         median_pred = float(np.median(valid_preds))
         final_pred = max(0.01, min(0.99, median_pred))
-        comment = self._format_comment("Debate", {"Proponent": proponent_arg, "Opponent": opponent_arg})
+        reasoning = self._format_debate_comment(proponent, opponent)
 
-        logger.info(f"Binary forecast for {question.page_url}: {final_pred:.2%}")
-        return ReasonedPrediction(prediction_value=final_pred, reasoning=comment)
+        return ReasonedPrediction(prediction_value=final_pred, reasoning=reasoning)
 
-    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        logger.info(f"--- Starting Numeric Analysis for: {question.page_url} ---")
-        low_arg = await self.get_llm("analyst_low", "llm").invoke(clean_indents(f"""
-            Act as an analyst arguing for a LOWER estimate. Build a case for why the final number will be on the low end of the plausible range.
-            Question: {question.question_text}, Research: {research}
-        """))
-        high_arg = await self.get_llm("analyst_high", "llm").invoke(clean_indents(f"""
-            Act as an analyst arguing for a HIGHER estimate. Build a case for why the final number will be on the high end of the plausible range.
-            Question: {question.question_text}, Research: {research}
-        """))
+    async def _run_forecast_on_numeric(
+        self, question: NumericQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        logger.info(f"Launching scenario analysis for numeric question: {question.page_url}")
 
-        synthesizer_prompt = clean_indents(f"""
-            You are a judge on a forecasting committee. Evaluate the competing analyses to arrive at a numeric distribution.
-            Question: "{question.question_text}"
-            Resolution Criteria: {question.resolution_criteria}, Research: {research}
-            --- Analyst Case for a LOW number ---\n{low_arg}\n--- END CASE ---
-            --- Analyst Case for a HIGH number ---\n{high_arg}\n--- END CASE ---
-            1. Summarize the strongest point from each analyst.
-            2. Write your final integrated rationale.
-            3. The very last thing you write must be your final distribution as three percentiles:
-            "P25: [value]\nP50: [value]\nP75: [value]"
+        # Monte Carlo-inspired low/high scenarios
+        low_prompt = clean_indents(f"""
+            Generate a plausible LOW-END scenario for: {question.question_text}
+            Use research to justify why the outcome could be near the lower bound.
+            Research: {research}
+        """)
+        high_prompt = clean_indents(f"""
+            Generate a plausible HIGH-END scenario for: {question.question_text}
+            Use research to justify why the outcome could be near the upper bound.
+            Research: {research}
         """)
 
-        predictions = await self._run_committee_and_parse(synthesizer_prompt, NumericDistribution)
+        low_scenario = await self.get_llm("analyst_low", "llm").invoke(low_prompt)
+        high_scenario = await self.get_llm("analyst_high", "llm").invoke(high_prompt)
+
+        synth_prompt = clean_indents(f"""
+            You are a superforecaster estimating a full distribution.
+            Question: "{question.question_text}"
+            Units: {question.unit_of_measure or 'inferred'}
+            Bounds: {self._format_bounds(question)}
+            Research: {research}
+            Low Scenario: {low_scenario}
+            High Scenario: {high_scenario}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            Output percentiles as:
+            Percentile 10: X
+            Percentile 20: X
+            Percentile 40: X
+            Percentile 60: X
+            Percentile 80: X
+            Percentile 90: X
+        """)
+
+        predictions = await self._run_synthesizers(synth_prompt, list[Percentile])
         valid_preds = [p for p in predictions if p]
-        if not valid_preds: raise ValueError("All numeric synthesizer predictions failed parsing.")
+        if not valid_preds:
+            raise ValueError("All synthesizers failed numeric parsing.")
 
-        p25 = np.median([p.p25 for p in valid_preds])
-        p50 = np.median([p.p50 for p in valid_preds])
-        p75 = np.median([p.p75 for p in valid_preds])
-        final_dist = NumericDistribution(p25=float(p25), p50=float(p50), p75=float(p75))
-        comment = self._format_comment("Numeric Analysis", {"Analyst Low": low_arg, "Analyst High": high_arg})
+        # Aggregate percentiles
+        all_p10 = [next((x.value for x in p if x.percentile == 10), None) for p in valid_preds]
+        all_p20 = [next((x.value for x in p if x.percentile == 20), None) for p in valid_preds]
+        all_p40 = [next((x.value for x in p if x.percentile == 40), None) for p in valid_preds]
+        all_p60 = [next((x.value for x in p if x.percentile == 60), None) for p in valid_preds]
+        all_p80 = [next((x.value for x in p if x.percentile == 80), None) for p in valid_preds]
+        all_p90 = [next((x.value for x in p if x.percentile == 90), None) for p in valid_preds]
 
-        logger.info(f"Numeric forecast for {question.page_url}: {final_dist}")
-        return ReasonedPrediction(prediction_value=final_dist, reasoning=comment)
+        def safe_median(vals):
+            clean = [v for v in vals if v is not None]
+            return float(np.median(clean)) if clean else 0.0
 
-    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
-        logger.info(f"--- Starting Multi-Option Analysis for: {question.page_url} ---")
-        options_str = "\n".join([f"- {opt}" for opt in question.options])
-        analyst_arg = await self.get_llm("analyst_mc", "llm").invoke(clean_indents(f"""
-            Act as an analyst. Provide a detailed evaluation of each possible option for the question based on the provided research.
+        percentile_list = [
+            Percentile(percentile=10, value=safe_median(all_p10)),
+            Percentile(percentile=20, value=safe_median(all_p20)),
+            Percentile(percentile=40, value=safe_median(all_p40)),
+            Percentile(percentile=60, value=safe_median(all_p60)),
+            Percentile(percentile=80, value=safe_median(all_p80)),
+            Percentile(percentile=90, value=safe_median(all_p90)),
+        ]
+
+        dist = NumericDistribution.from_question(percentile_list, question)
+        reasoning = self._format_scenario_comment(low_scenario, high_scenario)
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
+
+    async def _run_forecast_on_multiple_choice(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        logger.info(f"Launching domain analysis for MCQ: {question.page_url}")
+
+        # Route to domain-specialized analyst
+        domain = self._infer_domain(question.question_text)
+        analyst_key = f"analyst_{domain}"
+        if analyst_key not in self._llms:
+            analyst_key = "analyst_mc"  # fallback
+
+        eval_prompt = clean_indents(f"""
+            You are a {domain.upper()} expert evaluating options for:
             Question: {question.question_text}
-            Options:\n{options_str}\nResearch: {research}
-        """))
-
-        synthesizer_prompt = clean_indents(f"""
-            You are a judge on a forecasting committee. Use the analyst's report and research to assign probabilities to each option.
-            Question: "{question.question_text}"
-            Options:\n{options_str}\nResearch: {research}
-            --- Analyst's Evaluation of Options ---\n{analyst_arg}\n--- END EVALUATION ---
-            1. Write your final integrated rationale.
-            2. The very last thing you write is your list of probabilities. The probabilities MUST sum to 100%. Format it exactly as:
-            "Predictions:
-            Option Name 1: XX%
-            Option Name 2: YY%
-            ..."
+            Options: {question.options}
+            Research: {research}
+            Provide a balanced assessment of each option's likelihood.
         """)
-        predictions = await self._run_committee_and_parse(synthesizer_prompt, PredictedOptionList, question.options)
+
+        evaluation = await self.get_llm(analyst_key, "llm").invoke(eval_prompt)
+
+        synth_prompt = clean_indents(f"""
+            You are a superforecaster assigning probabilities to options.
+            Question: "{question.question_text}"
+            Options: {question.options}
+            Expert Evaluation: {evaluation}
+            Research: {research}
+            Assign probabilities that sum to 100%. Format as:
+            Option_A: XX%
+            Option_B: YY%
+            ...
+        """)
+
+        parsing_instructions = f"Valid options: {question.options}"
+        predictions = await self._run_synthesizers(
+            synth_prompt, PredictedOptionList, additional_instructions=parsing_instructions
+        )
         valid_preds = [p.as_dict for p in predictions if p]
-        if not valid_preds: raise ValueError("All multi-choice synthesizer predictions failed parsing.")
+        if not valid_preds:
+            raise ValueError("All MCQ synthesizers failed.")
 
-        avg_probs = {option: np.mean([pred[option] for pred in valid_preds]) for option in question.options}
-        total_prob = sum(avg_probs.values())
-        final_probs = {option: prob / total_prob for option, prob in avg_probs.items()}
-        final_pred = PredictedOptionList(list(final_probs.items()))
-        comment = self._format_comment("Multi-Option Analysis", {"Analyst": analyst_arg})
+        # Average probabilities
+        avg_probs = {}
+        for opt in question.options:
+            vals = [pred.get(opt, 0) for pred in valid_preds]
+            avg_probs[opt] = float(np.mean(vals))
+        total = sum(avg_probs.values())
+        if total > 0:
+            avg_probs = {k: v / total for k, v in avg_probs.items()}
 
-        logger.info(f"Multi-choice forecast for {question.page_url}: {final_pred}")
-        return ReasonedPrediction(prediction_value=final_pred, reasoning=comment)
+        final_pred = PredictedOptionList(list(avg_probs.items()))
+        reasoning = f"Domain: {domain.upper()}\nExpert Evaluation:\n{evaluation}"
+        return ReasonedPrediction(prediction_value=final_pred, reasoning=reasoning)
 
-    async def _run_committee_and_parse(self, prompt: str, output_type, options=None):
-        logger.info(f"Presenting to committee of {len(self.synthesizer_keys)}...")
-        tasks = [self.get_llm(key, "llm").invoke(prompt) for key in self.synthesizer_keys]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        parsing_tasks = []
-        for res in results:
-            if isinstance(res, Exception):
-                logger.error(f"Synthesizer failed: {res}")
-                parsing_tasks.append(asyncio.sleep(0, result=None))
-                continue
-            
+    def _infer_domain(self, text: str) -> str:
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in ["geopolitic", "war", "election", "country", "sanction"]):
+            return "geopolitical"
+        elif any(kw in text_lower for kw in ["ai", "model", "lab", "algorithm", "compute"]):
+            return "tech"
+        elif any(kw in text_lower for kw in ["climate", "temperature", "co2", "emission"]):
+            return "climate"
+        else:
+            return "general"
+
+    def _format_bounds(self, q: NumericQuestion) -> str:
+        low = q.nominal_lower_bound if q.nominal_lower_bound is not None else q.lower_bound
+        high = q.nominal_upper_bound if q.nominal_upper_bound is not None else q.upper_bound
+        return f"Lower: {low} (open: {q.open_lower_bound}), Upper: {high} (open: {q.open_upper_bound})"
+
+    async def _run_synthesizers(self, prompt: str, output_type, additional_instructions: str = ""):
+        tasks = []
+        for key in self.synthesizer_keys:
+            llm = self.get_llm(key, "llm")
+            response = await llm.invoke(prompt)
             if output_type == PredictedOptionList:
-                 parsing_tasks.append(structure_output(res, output_type, self.get_llm("parser", "llm"), options=options))
+                task = structure_output(response, output_type, self.get_llm("parser", "llm"), additional_instructions=additional_instructions)
             else:
-                 parsing_tasks.append(structure_output(res, output_type, self.get_llm("parser", "llm")))
+                task = structure_output(response, output_type, self.get_llm("parser", "llm"))
+            tasks.append(task)
 
-        parsed = await asyncio.gather(*parsing_tasks, return_exceptions=True)
-        return [p for p in parsed if not isinstance(p, Exception)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if not isinstance(r, Exception)]
 
-    def _format_comment(self, stage_name: str, args: dict) -> str:
-        comment = f"--- {stage_name.upper()} STAGE ---\n\n"
-        for agent_name, reasoning in args.items():
-            model_key = agent_name.lower().replace(" ", "_")
-            model_id = getattr(self.get_llm(model_key, 'llm'), 'model', 'unknown-model')
-            comment += f"--- Argument from {agent_name} Agent ({model_id}) ---\n\n{reasoning}\n\n"
-        return comment
+    def _format_debate_comment(self, pro: str, con: str) -> str:
+        return f"--- PROPONENT ---\n{pro}\n\n--- OPPONENT ---\n{con}"
 
-async def main():
-    parser = argparse.ArgumentParser(description="Run the CommitteeForecastingBot.")
-    parser.add_argument("--mode", type=str, choices=["tournament", "test_questions"], default="tournament")
-    parser.add_argument("--tournament-ids", nargs='+', type=str)
+    def _format_scenario_comment(self, low: str, high: str) -> str:
+        return f"--- LOW SCENARIO ---\n{low}\n\n--- HIGH SCENARIO ---\n{high}"
+
+
+# ======================
+# MAIN EXECUTION
+# ======================
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="Run AdaptiveCommitteeBot2025")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["tournament", "test_questions"],
+        default="test_questions",
+    )
     args = parser.parse_args()
 
-    committee_bot = CommitteeForecastingBot(
+    bot = AdaptiveCommitteeBot2025(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
+        publish_reports_to_metaculus=False,
+        skip_previously_forecasted_questions=False,
         llms={
-            "default": GeneralLlm(model="openrouter/openai/gpt-5-nano"),
-            "summarizer": GeneralLlm(model="openrouter/openai/gpt-5"),
-            "researcher": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.1),
-            "parser": GeneralLlm(model="openrouter/openai/gpt-4o-mini-search-preview"),
-            "proponent": GeneralLlm(model="openrouter/openai/gpt-4.1-nano", temperature=0.4),
-            "opponent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.4),
-            "analyst_low": GeneralLlm(model="openrouter/openai/gpt-4.1-mini", temperature=0.4),
-            "analyst_high": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.4),
-            "analyst_mc": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.3),
-            "synthesizer_1": GeneralLlm(model="openrouter/openai/gpt-5-nano", temperature=0.2),
-            "synthesizer_2": GeneralLlm(model="openrouter/openai/openai/gpt-5", temperature=0.2),
-            "synthesizer_3": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.2),
+            # Core roles
+            "default": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.3),
+            "parser": GeneralLlm(model="openrouter/openai/gpt-4o-mini", temperature=0.0),
+            # Debate agents
+            "proponent": GeneralLlm(model="openrouter/anthropic/claude-4.5-sonnet", temperature=0.5),
+            "opponent": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.5),
+            # Numeric analysts
+            "analyst_low": GeneralLlm(model="openrouter/meta/llama-3-70b", temperature=0.4),
+            "analyst_high": GeneralLlm(model="openrouter/openai/gpt-o3", temperature=0.4),
+            # MCQ domain analysts
+            "analyst_geopolitical": GeneralLlm(model="openrouter/anthropic/claude-4.5-sonnet", temperature=0.3),
+            "analyst_tech": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.3),
+            "analyst_climate": GeneralLlm(model="openrouter/meta/llama-3-70b", temperature=0.3),
+            "analyst_mc": GeneralLlm(model="openrouter/openai/gpt-4o", temperature=0.3),
+            # Synthesizers (diverse ensemble)
+            "synthesizer_1": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.1),
+            "synthesizer_2": GeneralLlm(model="openrouter/anthropic/claude-4.5-sonnet", temperature=0.1),
+            "synthesizer_3": GeneralLlm(model="openrouter/openai/gpt-o3", temperature=0.1),
         },
     )
 
-    forecast_reports = []
-    try:
-        if args.mode == "tournament":
-            logger.info("Running in tournament mode...")
-            # FIX: Updated the default list of tournament IDs to the user's specification.
-            ids = args.tournament_ids or ["market-pulse-25q4", "32813", "minibench"]
-            logger.info(f"Targeting tournaments: {ids}")
-            all_reports = []
-            for tournament_id in ids:
-                reports = await committee_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
-                all_reports.extend(reports)
-            forecast_reports = all_reports
-        else: # test_questions
-            logger.info("Running in test questions mode...")
-            URLS = [
-                "https://www.metaculus.com/questions/578/human-extinction-by-2100/", # Binary
-                "https://www.metaculus.com/questions/3475/date-of-first-human-on-mars/", # Numeric
-                "https://www.metaculus.com/questions/2618/cause-of-next-human-extinction-event/" # Multiple Choice
-            ]
-            questions = [MetaculusApi.get_question_by_url(url) for url in URLS]
-            forecast_reports = await committee_bot.forecast_questions(questions, return_exceptions=True)
-
-        committee_bot.log_report_summary(forecast_reports)
-        logger.info("Run finished successfully.")
-    except Exception as e:
-        logger.error(f"Run failed with a critical error: {e}", exc_info=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
+    if args.mode == "test_questions":
+        TEST_URLS = [
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+        ]
+        questions = [MetaculusApi.get_question_by_url(url) for url in TEST_URLS]
+        reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+        bot.log_report_summary(reports)
