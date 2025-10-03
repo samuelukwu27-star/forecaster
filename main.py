@@ -62,7 +62,7 @@ class EnhancedTournamentForecaster(ForecastBot):
             "default": "openrouter/openai/gpt-5",
             "summarizer": "openrouter/openai/gpt-4o",
             "parser": "openrouter/openai/gpt-4o-mini",
-            "researcher": "openrouter/perplexity/sonar",
+            "researcher": "openrouter/openai/gpt-5",
 
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
