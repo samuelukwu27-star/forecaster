@@ -39,9 +39,7 @@ NEWSAPI_API_KEY = os.getenv("NEWSAPI_KEY")
 class EnhancedTournamentForecaster(ForecastBot):
     """
     Full-featured forecaster for Metaculus tournaments.
-    Supports binary, numeric, and multiple-choice questions.
-    Research: Perplexity (real model) + NewsAPI.
-    Models: Real OpenRouter IDs aligned with your naming intent.
+    Supports all question types with real, working models.
     """
 
     _max_concurrent_questions = 1
@@ -56,12 +54,13 @@ class EnhancedTournamentForecaster(ForecastBot):
         logger.info("✅ EnhancedTournamentForecaster initialized")
 
     def _llm_config_defaults(self) -> dict[str, str]:
-        """Register all agent roles with REAL OpenRouter models."""
+        """Register all roles with REAL, working OpenRouter models."""
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "default": "openrouter/openai/gpt-5",
+            "default": "openrouter/openai/gpt-4o",
             "summarizer": "openrouter/openai/gpt-4o",
             "parser": "openrouter/openai/gpt-4o-mini",
+            # ✅ CORRECT Perplexity model for research
             "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",
 
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
@@ -71,11 +70,11 @@ class EnhancedTournamentForecaster(ForecastBot):
             "analyst_high": "openrouter/openai/gpt-4o",
 
             "analyst_geopolitical": "openrouter/anthropic/claude-3.5-sonnet",
-            "analyst_tech": "openrouter/openai/gpt-5",
+            "analyst_tech": "openrouter/openai/gpt-4o",
             "analyst_climate": "openrouter/openai/gpt-4o-mini",
-            "analyst_mc": "openrouter/openai/gpt-5",
+            "analyst_mc": "openrouter/openai/gpt-4o",
 
-            "synthesizer_1": "openrouter/openai/gpt-5",
+            "synthesizer_1": "openrouter/openai/gpt-4o",
             "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
             "synthesizer_3": "openrouter/openai/gpt-4o-mini",
         })
@@ -83,7 +82,7 @@ class EnhancedTournamentForecaster(ForecastBot):
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            # Perplexity via OpenRouter (real model)
+            # Perplexity research (real model)
             researcher_llm = self.get_llm("researcher", "llm")
             pplx_prompt = clean_indents(f"""
                 You are a forecasting research assistant.
@@ -94,8 +93,8 @@ class EnhancedTournamentForecaster(ForecastBot):
             """)
             pplx_research = await researcher_llm.invoke(pplx_prompt)
 
-            # NewsAPI
-            news_summary = "NewsAPI failed."
+            # NewsAPI (optional)
+            news_summary = "NewsAPI not used (key not set)."
             if NEWSAPI_API_KEY:
                 try:
                     articles = self.newsapi_client.get_everything(
@@ -210,13 +209,29 @@ class EnhancedTournamentForecaster(ForecastBot):
         """)
         parsing_instructions = f"Valid options: {question.options}. Remove any extra prefixes."
         preds = await self._run_synthesizers(synth_prompt, PredictedOptionList, parsing_instructions)
-        valid_preds = [p for p in preds if p and p.as_dict]
+        
+        # ✅ FIXED: No .as_dict — use dict(p) instead
+        valid_preds = []
+        for p in preds:
+            if p and isinstance(p, PredictedOptionList) and len(p) > 0:
+                try:
+                    pred_dict = dict(p)  # PredictedOptionList is list of (option, prob)
+                    if all(opt in pred_dict for opt in question.options):
+                        valid_preds.append(pred_dict)
+                except Exception as e:
+                    logger.warning(f"MCQ parsing error: {e}")
+                    continue
+
         if not valid_preds:
             uniform = [(opt, 1.0 / len(question.options)) for opt in question.options]
-            return ReasonedPrediction(prediction_value=PredictedOptionList(uniform), reasoning="Fallback: uniform.")
+            return ReasonedPrediction(
+                prediction_value=PredictedOptionList(uniform),
+                reasoning="Fallback: uniform due to parsing failure."
+            )
+
         avg_probs = {}
         for opt in question.options:
-            probs = [p.as_dict.get(opt, 0) for p in valid_preds]
+            probs = [pred.get(opt, 0) for pred in valid_preds]
             avg_probs[opt] = float(np.mean(probs))
         total = sum(avg_probs.values())
         if total > 0:
@@ -244,14 +259,13 @@ class EnhancedTournamentForecaster(ForecastBot):
 
 if __name__ == "__main__":
     if not NEWSAPI_API_KEY:
-        logger.warning("⚠️ NEWSAPI_API_KEY not set")
+        logger.warning("⚠️ NEWSAPI_API_KEY not set — news research disabled")
 
     bot = EnhancedTournamentForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        # All roles covered by _llm_config_defaults
     )
 
     TOURNAMENT_IDS = ["minibench", "32813", "32831", "colombia-wage-watch"]
@@ -264,4 +278,4 @@ if __name__ == "__main__":
         all_reports.extend(reports)
 
     bot.log_report_summary(all_reports)
-    logger.info("✅ Run completed.")
+    logger.info("✅ Run completed successfully.")
