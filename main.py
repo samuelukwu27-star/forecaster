@@ -19,7 +19,6 @@ from forecasting_tools import (
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
-    SmartSearcher,
     clean_indents,
     structure_output,
 )
@@ -27,19 +26,23 @@ from forecasting_tools import (
 logger = logging.getLogger(__name__)
 
 
-class HybridTournamentBot2025(ForecastBot):
+class PerplexityHybridBot2025(ForecastBot):
     """
-    Hybrid bot combining template structure with multi-synthesizer forecasting.
-    Uses SmartSearcher + Claude 3.5 Sonnet for research, and 5-model ensemble for synthesis.
+    Hybrid forecasting bot using Perplexity (via OpenRouter) for live research
+    and a 5-model ensemble for robust prediction synthesis.
+    
+    Researcher: openrouter/perplexity/llama-3.1-sonar-large-128k-online
     """
 
     def _llm_config_defaults(self) -> dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
+            # Researcher: Perplexity with live web search
+            "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",
+
+            # Forecasting pipeline
             "default": "openrouter/openai/gpt-5",
-            "summarizer": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
-            "researcher": "smart-searcher/openrouter/anthropic/claude-sonnet-4",
 
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
@@ -52,11 +55,12 @@ class HybridTournamentBot2025(ForecastBot):
             "analyst_climate": "openrouter/openai/gpt-4o-mini",
             "analyst_mc": "openrouter/openai/gpt-5",
 
+            # 5 Synthesizers for aggregation
             "synthesizer_1": "openrouter/openai/gpt-5",
-            "synthesizer_2": "openrouter/anthropic/claude-sonnet-4",
+            "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
             "synthesizer_3": "openrouter/openai/gpt-4o",
             "synthesizer_4": "openrouter/anthropic/claude-3-opus",
-            "synthesizer_5": "openrouter/openai/gpt-5",
+            "synthesizer_5": "openrouter/openai/gpt-4o-mini",
         })
         return defaults
 
@@ -65,38 +69,21 @@ class HybridTournamentBot2025(ForecastBot):
         self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
         if len(self.synthesizer_keys) < 3:
             logger.warning("Fewer than 3 synthesizers found — may reduce robustness.")
-        logger.info(f"Intialized with {len(self.synthesizer_keys)} synthesizers.")
+        logger.info(f"Initialized with {len(self.synthesizer_keys)} synthesizers.")
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        research = ""
-        researcher = self.get_llm("researcher")
-
+        researcher_llm = self.get_llm("researcher", "llm")
         prompt = clean_indents(f"""
-            You are an assistant to a superforecaster.
-            Summarize key facts for: {question.question_text}
+            You are a forecasting research assistant.
+            Provide a concise, factual summary with recent data for:
+            Question: {question.question_text}
             Resolution Criteria: {question.resolution_criteria}
             Fine Print: {question.fine_print}
             Today: {datetime.now().strftime('%Y-%m-%d')}
-            Be concise, factual, and focus on recent trends or data.
+            Focus on trends, breakthroughs, or events that could affect the outcome.
+            If the question is highly speculative or about the distant future with no current data, state that clearly.
         """)
-
-        if isinstance(researcher, GeneralLlm):
-            research = await researcher.invoke(prompt)
-        elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
-            model_name = researcher.removeprefix("smart-searcher/")
-            searcher = SmartSearcher(
-                model=model_name,
-                temperature=0,
-                num_searches_to_run=2,
-                num_sites_per_search=10,
-                use_advanced_filters=False,
-            )
-            research = await searcher.invoke(prompt)
-        elif not researcher or researcher == "None":
-            research = ""
-        else:
-            research = await self.get_llm("researcher", "llm").invoke(prompt)
-
+        research = await researcher_llm.invoke(prompt)
         logger.info(f"Research for {question.page_url}:\n{research}")
         return research
 
@@ -208,7 +195,7 @@ class HybridTournamentBot2025(ForecastBot):
         for p in preds:
             if p and isinstance(p, PredictedOptionList) and len(p) > 0:
                 try:
-                    pred_dict = dict(p)  # PredictedOptionList is list of (option, prob)
+                    pred_dict = dict(p)
                     if all(opt in pred_dict for opt in question.options):
                         valid_preds.append(pred_dict)
                 except Exception as e:
@@ -260,7 +247,7 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run HybridTournamentBot2025")
+    parser = argparse.ArgumentParser(description="Run PerplexityHybridBot2025")
     parser.add_argument(
         "--mode",
         type=str,
@@ -271,16 +258,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
-    bot = HybridTournamentBot2025(
+    bot = PerplexityHybridBot2025(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        # Uncomment to override models:
-        # llms={
-        #     "researcher": "smart-searcher/openrouter/anthropic/claude-3.5-sonnet",
-        #     ...
-        # }
     )
 
     if run_mode == "tournament":
@@ -311,4 +293,4 @@ if __name__ == "__main__":
         reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
 
     bot.log_report_summary(reports)
-    logger.info("✅ Hybrid run completed.")
+    logger.info("✅ Perplexity Hybrid run completed.")
