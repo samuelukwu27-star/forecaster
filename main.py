@@ -61,7 +61,7 @@ class EnhancedTournamentForecaster(ForecastBot):
             "summarizer": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
             # ✅ CORRECT Perplexity model for research
-            "researcher": "openrouter/perplexity/llama-3.1-sonar-small-128k-online",
+            "researcher": "openrouter/anthropic/claude-3.5-sonnet",
 
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
