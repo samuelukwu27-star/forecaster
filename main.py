@@ -57,8 +57,8 @@ class EnhancedTournamentForecaster(ForecastBot):
         """Register all roles with REAL, working OpenRouter models."""
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "default": "openrouter/openai/gpt-4o",
-            "summarizer": "openrouter/openai/gpt-4o",
+            "default": "openrouter/openai/gpt-5",
+            "summarizer": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
             # ✅ CORRECT Perplexity model for research
             "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",
@@ -74,7 +74,7 @@ class EnhancedTournamentForecaster(ForecastBot):
             "analyst_climate": "openrouter/openai/gpt-4o-mini",
             "analyst_mc": "openrouter/openai/gpt-4o",
 
-            "synthesizer_1": "openrouter/openai/gpt-4o",
+            "synthesizer_1": "openrouter/openai/gpt-5",
             "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
             "synthesizer_3": "openrouter/openai/gpt-4o-mini",
         })
