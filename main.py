@@ -31,14 +31,14 @@ class PerplexityHybridBot2025(ForecastBot):
     Hybrid forecasting bot using Perplexity (via OpenRouter) for live research
     and a 5-model ensemble for robust prediction synthesis.
     
-    Researcher: openrouter/perplexity/llama-3.1-sonar-large-128k-online
+    Researcher: openrouter/perplexity/llama-3-sonar-large-32k-online
     """
 
     def _llm_config_defaults(self) -> dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
             # Researcher: Perplexity with live web search
-            "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",
+            "researcher": "openrouter/perplexity/llama-3-sonar-large-32k-online",
 
             # Forecasting pipeline
             "default": "openrouter/openai/gpt-5",
