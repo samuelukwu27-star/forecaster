@@ -19,6 +19,7 @@ from forecasting_tools import (
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
+    SmartSearcher,
     clean_indents,
     structure_output,
 )
@@ -28,25 +29,18 @@ logger = logging.getLogger(__name__)
 
 class HybridTournamentBot2025(ForecastBot):
     """
-    Hybrid bot combining the clean structure of FallTemplateBot2025 with the
-    multi-synthesizer, multi-agent forecasting logic from EnhancedTournamentForecaster.
-    
-    Uses:
-      - Researcher: claude-3.5-sonnet
-      - 5 synthesizers for robust aggregation
-      - Debate-style (binary), scenario-based (numeric), and domain-aware (MCQ) reasoning
+    Hybrid bot combining template structure with multi-synthesizer forecasting.
+    Uses SmartSearcher + Claude 3.5 Sonnet for research, and 5-model ensemble for synthesis.
     """
 
     def _llm_config_defaults(self) -> dict[str, str]:
-        """Define default models if not provided by user."""
         defaults = super()._llm_config_defaults()
         defaults.update({
             "default": "openrouter/openai/gpt-5",
             "summarizer": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
-            "researcher": "openrouter/anthropic/claude-3.5-sonnet",
+            "researcher": "smart-searcher/openrouter/anthropic/claude-sonnet-4",
 
-            # Forecasting roles
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
 
@@ -58,35 +52,51 @@ class HybridTournamentBot2025(ForecastBot):
             "analyst_climate": "openrouter/openai/gpt-4o-mini",
             "analyst_mc": "openrouter/openai/gpt-5",
 
-            # 5 Synthesizers (as in original)
             "synthesizer_1": "openrouter/openai/gpt-5",
-            "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
+            "synthesizer_2": "openrouter/anthropic/claude-sonnet-4",
             "synthesizer_3": "openrouter/openai/gpt-4o",
             "synthesizer_4": "openrouter/anthropic/claude-3-opus",
-            "synthesizer_5": "openrouter/openai/gpt-4o-mini",
+            "synthesizer_5": "openrouter/openai/gpt-5",
         })
         return defaults
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Collect synthesizer keys
         self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
         if len(self.synthesizer_keys) < 3:
             logger.warning("Fewer than 3 synthesizers found — may reduce robustness.")
         logger.info(f"Intialized with {len(self.synthesizer_keys)} synthesizers.")
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        # Use the researcher LLM (Claude 3.5 Sonnet by default)
-        researcher_llm = self.get_llm("researcher", "llm")
+        research = ""
+        researcher = self.get_llm("researcher")
+
         prompt = clean_indents(f"""
-            You are a forecasting research assistant.
+            You are an assistant to a superforecaster.
             Summarize key facts for: {question.question_text}
             Resolution Criteria: {question.resolution_criteria}
             Fine Print: {question.fine_print}
             Today: {datetime.now().strftime('%Y-%m-%d')}
             Be concise, factual, and focus on recent trends or data.
         """)
-        research = await researcher_llm.invoke(prompt)
+
+        if isinstance(researcher, GeneralLlm):
+            research = await researcher.invoke(prompt)
+        elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
+            model_name = researcher.removeprefix("smart-searcher/")
+            searcher = SmartSearcher(
+                model=model_name,
+                temperature=0,
+                num_searches_to_run=2,
+                num_sites_per_search=10,
+                use_advanced_filters=False,
+            )
+            research = await searcher.invoke(prompt)
+        elif not researcher or researcher == "None":
+            research = ""
+        else:
+            research = await self.get_llm("researcher", "llm").invoke(prompt)
+
         logger.info(f"Research for {question.page_url}:\n{research}")
         return research
 
@@ -144,13 +154,14 @@ class HybridTournamentBot2025(ForecastBot):
         valid_preds = [p for p in preds if p and len(p) >= 6]
         if not valid_preds:
             mid = (question.lower_bound + question.upper_bound) / 2
+            # ✅ FIXED: Use keyword arguments for Percentile
             fallback_percentiles = [
-                Percentile(10, max(question.lower_bound, mid * 0.5)),
-                Percentile(20, max(question.lower_bound, mid * 0.7)),
-                Percentile(40, mid * 0.9),
-                Percentile(60, mid * 1.1),
-                Percentile(80, min(question.upper_bound, mid * 1.3)),
-                Percentile(90, min(question.upper_bound, mid * 1.5)),
+                Percentile(percentile=10, value=max(question.lower_bound, mid * 0.5)),
+                Percentile(percentile=20, value=max(question.lower_bound, mid * 0.7)),
+                Percentile(percentile=40, value=mid * 0.9),
+                Percentile(percentile=60, value=mid * 1.1),
+                Percentile(percentile=80, value=min(question.upper_bound, mid * 1.3)),
+                Percentile(percentile=90, value=min(question.upper_bound, mid * 1.5)),
             ]
             dist = NumericDistribution.from_question(fallback_percentiles, question)
             return ReasonedPrediction(prediction_value=dist, reasoning="Fallback due to parsing failure.")
@@ -158,13 +169,13 @@ class HybridTournamentBot2025(ForecastBot):
         all_vals = {10: [], 20: [], 40: [], 60: [], 80: [], 90: []}
         for pred in valid_preds:
             for p in pred:
-                if p.percentile in all_vals:
+                if hasattr(p, 'percentile') and hasattr(p, 'value') and p.percentile in all_vals:
                     all_vals[p.percentile].append(p.value)
         aggregated = []
         for pt in [10, 20, 40, 60, 80, 90]:
             vals = all_vals[pt]
             med = float(np.median(vals)) if vals else (question.lower_bound + question.upper_bound) / 2
-            aggregated.append(Percentile(pt, med))
+            aggregated.append(Percentile(percentile=pt, value=med))
         dist = NumericDistribution.from_question(aggregated, question)
         reasoning = f"LOW:\n{low}\n\nHIGH:\n{high}"
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
@@ -197,7 +208,7 @@ class HybridTournamentBot2025(ForecastBot):
         for p in preds:
             if p and isinstance(p, PredictedOptionList) and len(p) > 0:
                 try:
-                    pred_dict = dict(p)
+                    pred_dict = dict(p)  # PredictedOptionList is list of (option, prob)
                     if all(opt in pred_dict for opt in question.options):
                         valid_preds.append(pred_dict)
                 except Exception as e:
@@ -265,17 +276,29 @@ if __name__ == "__main__":
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        # You can override llms here if desired
+        # Uncomment to override models:
+        # llms={
+        #     "researcher": "smart-searcher/openrouter/anthropic/claude-3.5-sonnet",
+        #     ...
+        # }
     )
 
     if run_mode == "tournament":
-        seasonal = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
-        minibench = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True))
-        market_pulse = asyncio.run(bot.forecast_on_tournament("market-pulse-25q4", return_exceptions=True))
-        reports = seasonal + minibench
+        seasonal = asyncio.run(
+            bot.forecast_on_tournament(MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True)
+        )
+        minibench = asyncio.run(
+            bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+        )
+        market_pulse = asyncio.run(
+            bot.forecast_on_tournament("market-pulse-25q4", return_exceptions=True)
+        )
+        reports = seasonal + minibench + market_pulse
     elif run_mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
-        reports = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+        reports = asyncio.run(
+            bot.forecast_on_tournament(MetaculusApi.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
+        )
     elif run_mode == "test_questions":
         EXAMPLE_QUESTIONS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
