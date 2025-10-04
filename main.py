@@ -1,11 +1,11 @@
 import argparse
 import asyncio
 import logging
-import os
 from datetime import datetime
 from typing import Literal
 
 import numpy as np
+
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -22,47 +22,31 @@ from forecasting_tools import (
     clean_indents,
     structure_output,
 )
-from newsapi import NewsApiClient
 
-# -----------------------------
-# Logging & API Keys
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-NEWSAPI_API_KEY = os.getenv("NEWSAPI_KEY")
 
-
-class EnhancedTournamentForecaster(ForecastBot):
+class HybridTournamentBot2025(ForecastBot):
     """
-    Full-featured forecaster for Metaculus tournaments.
-    Supports all question types with real, working models.
+    Hybrid bot combining the clean structure of FallTemplateBot2025 with the
+    multi-synthesizer, multi-agent forecasting logic from EnhancedTournamentForecaster.
+    
+    Uses:
+      - Researcher: claude-3.5-sonnet
+      - 5 synthesizers for robust aggregation
+      - Debate-style (binary), scenario-based (numeric), and domain-aware (MCQ) reasoning
     """
-
-    _max_concurrent_questions = 1
-    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
-        self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
-        if len(self.synthesizer_keys) < 3:
-            raise ValueError("At least 3 synthesizer models required.")
-        logger.info("✅ EnhancedTournamentForecaster initialized")
 
     def _llm_config_defaults(self) -> dict[str, str]:
-        """Register all roles with REAL, working OpenRouter models."""
+        """Define default models if not provided by user."""
         defaults = super()._llm_config_defaults()
         defaults.update({
             "default": "openrouter/openai/gpt-5",
             "summarizer": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
-            # ✅ CORRECT Perplexity model for research
             "researcher": "openrouter/anthropic/claude-3.5-sonnet",
 
+            # Forecasting roles
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
 
@@ -74,59 +58,52 @@ class EnhancedTournamentForecaster(ForecastBot):
             "analyst_climate": "openrouter/openai/gpt-4o-mini",
             "analyst_mc": "openrouter/openai/gpt-5",
 
+            # 5 Synthesizers (as in original)
             "synthesizer_1": "openrouter/openai/gpt-5",
-            "synthesizer_2": "openrouter/anthropic/claude-sonnet-4",
-            "synthesizer_3": "openrouter/openai/gpt-4o-mini",
+            "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
+            "synthesizer_3": "openrouter/openai/gpt-4o",
+            "synthesizer_4": "openrouter/anthropic/claude-3-opus",
+            "synthesizer_5": "openrouter/openai/gpt-4o-mini",
         })
         return defaults
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Collect synthesizer keys
+        self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
+        if len(self.synthesizer_keys) < 3:
+            logger.warning("Fewer than 3 synthesizers found — may reduce robustness.")
+        logger.info(f"Intialized with {len(self.synthesizer_keys)} synthesizers.")
+
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            # Perplexity research (real model)
-            researcher_llm = self.get_llm("researcher", "llm")
-            pplx_prompt = clean_indents(f"""
-                You are a forecasting research assistant.
-                Summarize key facts for: {question.question_text}
-                Resolution Criteria: {question.resolution_criteria}
-                Today: {datetime.now().strftime('%Y-%m-%d')}
-                Be concise, factual, and focus on recent trends or data.
-            """)
-            pplx_research = await researcher_llm.invoke(pplx_prompt)
-
-            # NewsAPI (optional)
-            news_summary = "NewsAPI not used (key not set)."
-            if NEWSAPI_API_KEY:
-                try:
-                    articles = self.newsapi_client.get_everything(
-                        q=question.question_text, language='en', sort_by='relevancy', page_size=5
-                    )
-                    if articles and articles.get('articles'):
-                        news_summary = "\n".join([
-                            f"- {a['title']}: {a.get('description', 'N/A')}"
-                            for a in articles['articles']
-                        ])
-                    else:
-                        news_summary = "No recent news found."
-                except Exception as e:
-                    news_summary = f"NewsAPI error: {e}"
-
-            return clean_indents(f"""
-                PERPLEXITY RESEARCH:
-                {pplx_research}
-
-                NEWSAPI:
-                {news_summary}
-            """)
+        # Use the researcher LLM (Claude 3.5 Sonnet by default)
+        researcher_llm = self.get_llm("researcher", "llm")
+        prompt = clean_indents(f"""
+            You are a forecasting research assistant.
+            Summarize key facts for: {question.question_text}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            Be concise, factual, and focus on recent trends or data.
+        """)
+        research = await researcher_llm.invoke(prompt)
+        logger.info(f"Research for {question.page_url}:\n{research}")
+        return research
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        pro = await self.get_llm("proponent", "llm").invoke(clean_indents(f"Argue YES: {question.question_text}\n{research}"))
-        con = await self.get_llm("opponent", "llm").invoke(clean_indents(f"Argue NO: {question.question_text}\n{research}"))
+        pro = await self.get_llm("proponent", "llm").invoke(
+            clean_indents(f"Argue YES: {question.question_text}\n{research}")
+        )
+        con = await self.get_llm("opponent", "llm").invoke(
+            clean_indents(f"Argue NO: {question.question_text}\n{research}")
+        )
         synth_prompt = clean_indents(f"""
             Judge this debate.
             Question: {question.question_text}
             Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
             Today: {datetime.now().strftime('%Y-%m-%d')}
             Research: {research}
             PRO (YES): {pro}
@@ -136,13 +113,18 @@ class EnhancedTournamentForecaster(ForecastBot):
         preds = await self._run_synthesizers(synth_prompt, BinaryPrediction)
         valid = [p.prediction_in_decimal for p in preds if p]
         final = max(0.01, min(0.99, float(np.median(valid)) if valid else 0.5))
-        return ReasonedPrediction(prediction_value=final, reasoning=f"PRO:\n{pro}\n\nCON:\n{con}")
+        reasoning = f"PRO:\n{pro}\n\nCON:\n{con}"
+        return ReasonedPrediction(prediction_value=final, reasoning=reasoning)
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        low = await self.get_llm("analyst_low", "llm").invoke(f"Low scenario: {question.question_text}\n{research}")
-        high = await self.get_llm("analyst_high", "llm").invoke(f"High scenario: {question.question_text}\n{research}")
+        low = await self.get_llm("analyst_low", "llm").invoke(
+            f"Low scenario: {question.question_text}\n{research}"
+        )
+        high = await self.get_llm("analyst_high", "llm").invoke(
+            f"High scenario: {question.question_text}\n{research}"
+        )
         synth_prompt = clean_indents(f"""
             Estimate percentiles for: {question.question_text}
             Units: {question.unit_of_measure or 'inferred'}
@@ -184,7 +166,8 @@ class EnhancedTournamentForecaster(ForecastBot):
             med = float(np.median(vals)) if vals else (question.lower_bound + question.upper_bound) / 2
             aggregated.append(Percentile(pt, med))
         dist = NumericDistribution.from_question(aggregated, question)
-        return ReasonedPrediction(prediction_value=dist, reasoning=f"LOW:\n{low}\n\nHIGH:\n{high}")
+        reasoning = f"LOW:\n{low}\n\nHIGH:\n{high}"
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -210,12 +193,11 @@ class EnhancedTournamentForecaster(ForecastBot):
         parsing_instructions = f"Valid options: {question.options}. Remove any extra prefixes."
         preds = await self._run_synthesizers(synth_prompt, PredictedOptionList, parsing_instructions)
         
-        # ✅ FIXED: No .as_dict — use dict(p) instead
         valid_preds = []
         for p in preds:
             if p and isinstance(p, PredictedOptionList) and len(p) > 0:
                 try:
-                    pred_dict = dict(p)  # PredictedOptionList is list of (option, prob)
+                    pred_dict = dict(p)
                     if all(opt in pred_dict for opt in question.options):
                         valid_preds.append(pred_dict)
                 except Exception as e:
@@ -258,24 +240,51 @@ class EnhancedTournamentForecaster(ForecastBot):
 # ======================
 
 if __name__ == "__main__":
-    if not NEWSAPI_API_KEY:
-        logger.warning("⚠️ NEWSAPI_API_KEY not set — news research disabled")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
-    bot = EnhancedTournamentForecaster(
+    litellm_logger = logging.getLogger("LiteLLM")
+    litellm_logger.setLevel(logging.WARNING)
+    litellm_logger.propagate = False
+
+    parser = argparse.ArgumentParser(description="Run HybridTournamentBot2025")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["tournament", "metaculus_cup", "test_questions"],
+        default="tournament",
+        help="Run mode",
+    )
+    args = parser.parse_args()
+    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+
+    bot = HybridTournamentBot2025(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
+        # You can override llms here if desired
     )
 
-    TOURNAMENT_IDS = ["minibench", "32813", "32831", "colombia-wage-watch"]
-    logger.info(f"🎯 Forecasting on tournaments: {TOURNAMENT_IDS}")
+    if run_mode == "tournament":
+        seasonal = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+        minibench = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        reports = seasonal + minibench
+    elif run_mode == "metaculus_cup":
+        bot.skip_previously_forecasted_questions = False
+        reports = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+    elif run_mode == "test_questions":
+        EXAMPLE_QUESTIONS = [
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
+        ]
+        bot.skip_previously_forecasted_questions = False
+        questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
+        reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
 
-    all_reports = []
-    for tid in TOURNAMENT_IDS:
-        logger.info(f"▶️ Starting tournament: {tid}")
-        reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
-        all_reports.extend(reports)
-
-    bot.log_report_summary(all_reports)
-    logger.info("✅ Run completed successfully.")
+    bot.log_report_summary(reports)
+    logger.info("✅ Hybrid run completed.")
