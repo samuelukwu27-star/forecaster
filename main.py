@@ -271,6 +271,7 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         seasonal = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
         minibench = asyncio.run(bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        market_pulse = asyncio.run(bot.forecast_on_tournament("market-pulse-25q4", return_exceptions=True))
         reports = seasonal + minibench
     elif run_mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
