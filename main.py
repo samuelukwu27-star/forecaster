@@ -61,7 +61,7 @@ class EnhancedTournamentForecaster(ForecastBot):
             "summarizer": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
             # ✅ CORRECT Perplexity model for research
-            "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",
+            "researcher": "openrouter/perplexity/llama-3.1-sonar-small-128k-online",
 
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
@@ -70,12 +70,12 @@ class EnhancedTournamentForecaster(ForecastBot):
             "analyst_high": "openrouter/openai/gpt-4o",
 
             "analyst_geopolitical": "openrouter/anthropic/claude-3.5-sonnet",
-            "analyst_tech": "openrouter/openai/gpt-4o",
+            "analyst_tech": "openrouter/openai/gpt-5",
             "analyst_climate": "openrouter/openai/gpt-4o-mini",
-            "analyst_mc": "openrouter/openai/gpt-4o",
+            "analyst_mc": "openrouter/openai/gpt-5",
 
             "synthesizer_1": "openrouter/openai/gpt-5",
-            "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
+            "synthesizer_2": "openrouter/anthropic/claude-sonnet-4",
             "synthesizer_3": "openrouter/openai/gpt-4o-mini",
         })
         return defaults
