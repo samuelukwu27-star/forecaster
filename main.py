@@ -57,7 +57,7 @@ class PerplexityHybridBot2025(ForecastBot):
 
             # 5 Synthesizers for aggregation
             "synthesizer_1": "openrouter/openai/gpt-5",
-            "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
+            "synthesizer_2": "openrouter/anthropic/claude-sonnet-4.5",
             "synthesizer_3": "openrouter/openai/gpt-5",
             "synthesizer_4": "openrouter/anthropic/claude-sonnet-4",
             "synthesizer_5": "openrouter/openai/gpt-4o-mini",
