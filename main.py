@@ -31,14 +31,14 @@ class PerplexityHybridBot2025(ForecastBot):
     Hybrid forecasting bot using Perplexity (via OpenRouter) for live research
     and a 5-model ensemble for robust prediction synthesis.
     
-    Researcher: openrouter/perplexity/llama-3-sonar-small-32k-online
+    Researcher: openrouter/perplexity/mistral-7b-instruct-online
     """
 
     def _llm_config_defaults(self) -> dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
             # Researcher: Perplexity with live web search
-            "researcher": "openrouter/perplexity/llama-3-sonar-small-32k-online",
+            "researcher": "openrouter/perplexity/mistral-7b-instruct-online",
 
             # Forecasting pipeline
             "default": "openrouter/openai/gpt-5",
@@ -47,7 +47,7 @@ class PerplexityHybridBot2025(ForecastBot):
             "proponent": "openrouter/anthropic/claude-3.5-sonnet",
             "opponent": "openrouter/openai/gpt-4o",
 
-            "analyst_low": "openrouter/openai/gpt-4o-mini",
+            "analyst_low": "openrouter/anthropic/claude-opus-4.1",
             "analyst_high": "openrouter/openai/gpt-4o",
 
             "analyst_geopolitical": "openrouter/anthropic/claude-3.5-sonnet",
@@ -58,8 +58,8 @@ class PerplexityHybridBot2025(ForecastBot):
             # 5 Synthesizers for aggregation
             "synthesizer_1": "openrouter/openai/gpt-5",
             "synthesizer_2": "openrouter/anthropic/claude-3.5-sonnet",
-            "synthesizer_3": "openrouter/openai/gpt-4o",
-            "synthesizer_4": "openrouter/anthropic/claude-3-opus",
+            "synthesizer_3": "openrouter/openai/gpt-5",
+            "synthesizer_4": "openrouter/anthropic/claude-sonnet-4",
             "synthesizer_5": "openrouter/openai/gpt-4o-mini",
         })
         return defaults
