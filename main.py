@@ -2,7 +2,7 @@ import argparse
 import asyncio
 import logging
 from datetime import datetime
-from typing import Literal, List, Optional
+from typing import Literal
 import numpy as np
 
 from forecasting_tools import (
@@ -25,8 +25,8 @@ from forecasting_tools import (
 logger = logging.getLogger(__name__)
 
 # Bot metadata
-BOT_NAME = "PerplexityHybridBot2025"
-BOT_REPO_URL = "https://github.com/your-username/forecaster"  # ← Update this!
+BOT_NAME = "samcodes"
+BOT_REPO_URL = "https://github.com/samuelukwu27-star/forecaster/"
 
 
 class PerplexityHybridBot2025(ForecastBot):
@@ -91,27 +91,31 @@ class PerplexityHybridBot2025(ForecastBot):
         logger.info(f"Research for {question.page_url}:\n{research}")
         return research
 
-    async def _run_individual_question_with_error_propagation(self, question: MetaculusQuestion):
-        try:
-            research = await self.run_research(question)
-            prediction = await self._run_forecast_on_question(question, research)
-            report = await self._create_and_publish_report(question, prediction, research)
+    async def _create_and_publish_report(
+        self,
+        question: MetaculusQuestion,
+        prediction: ReasonedPrediction,
+        research: str
+    ) -> dict:
+        # Let base class handle prediction submission
+        report = await super()._create_and_publish_report(question, prediction, research)
 
-            if self.publish_research_as_comments and self.publish_reports_to_metaculus:
-                try:
-                    # Format final prediction for comment
-                    if isinstance(prediction.prediction_value, float):
-                        final_pred_str = f"{prediction.prediction_value:.1%}"
-                    elif isinstance(prediction.prediction_value, NumericDistribution):
-                        median_val = prediction.prediction_value.get_percentile_value(0.5)
-                        final_pred_str = f"Median: ~{median_val:.1f}"
-                    elif isinstance(prediction.prediction_value, PredictedOptionList):
-                        top_opt = max(prediction.prediction_value, key=lambda x: x[1])
-                        final_pred_str = f"Top: {top_opt[0]} ({top_opt[1]:.1%})"
-                    else:
-                        final_pred_str = str(prediction.prediction_value)
+        # Post comment if enabled
+        if self.publish_research_as_comments and self.publish_reports_to_metaculus:
+            try:
+                # Format final prediction
+                if isinstance(prediction.prediction_value, float):
+                    final_pred_str = f"{prediction.prediction_value:.1%}"
+                elif isinstance(prediction.prediction_value, NumericDistribution):
+                    median_val = prediction.prediction_value.get_percentile_value(0.5)
+                    final_pred_str = f"Median: ~{median_val:.1f}"
+                elif isinstance(prediction.prediction_value, PredictedOptionList):
+                    top_opt = max(prediction.prediction_value, key=lambda x: x[1])
+                    final_pred_str = f"Top: {top_opt[0]} ({top_opt[1]:.1%})"
+                else:
+                    final_pred_str = str(prediction.prediction_value)
 
-                    comment_text = f"""**{BOT_NAME} Forecast Summary**
+                comment_text = f"""**{BOT_NAME} Forecast Summary**
 
 **Final Prediction**: {final_pred_str}
 
@@ -121,30 +125,16 @@ class PerplexityHybridBot2025(ForecastBot):
 **Reasoning**:
 {prediction.reasoning}
 
-**Synthesizer Outputs** (raw):
-{self._format_synthesizer_outputs(getattr(self, '_last_synthesizer_outputs', []))}
-
 ---
-*Architecture*: Multi-agent ensemble (GPT-5, Claude 3.5/Opus, GPT-4o) with researcher, debaters, analysts, and 5 synthesizers. Median-aggregated to reduce overconfidence.  
-*Bot*: [{Samcodes}]({https://github.com/samuelukwu27-star/forecaster/})
+*Architecture*: Multi-agent ensemble (GPT-5, Claude 3.5/Opus, GPT-4o) with researcher, debaters, analysts, and 5 synthesizers. Median-aggregated when ≥3 valid outputs to reduce overconfidence.  
+*Bot*: [{BOT_NAME}]({BOT_REPO_URL})
 """
-                    await MetaculusApi.post_comment(question.id, comment_text)
-                    logger.info(f"Posted research comment on question {question.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to post comment on question {question.id}: {e}")
+                await MetaculusApi.post_comment(question.id, comment_text)
+                logger.info(f"Posted research comment on question {question.id}")
+            except Exception as e:
+                logger.warning(f"Failed to post comment on question {question.id}: {e}")
 
-            return report
-        except Exception as e:
-            error_message = f"Error while processing question url: '{question.page_url}'"
-            self._reraise_exception_with_prepended_message(e, error_message)
-
-    def _format_synthesizer_outputs(self, outputs: list) -> str:
-        if not outputs:
-            return "No synthesizer outputs available."
-        lines = []
-        for i, out in enumerate(outputs, 1):
-            lines.append(f"- Synth {i}: {out}")
-        return "\n".join(lines)
+        return report
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
@@ -168,7 +158,6 @@ class PerplexityHybridBot2025(ForecastBot):
         """)
         preds = await self._run_synthesizers(synth_prompt, BinaryPrediction)
         valid = [p.prediction_in_decimal for p in preds if p]
-        self._last_synthesizer_outputs = valid  # for comment
 
         if len(valid) >= 3:
             final = float(np.median(valid))
@@ -218,7 +207,6 @@ class PerplexityHybridBot2025(ForecastBot):
                 normalized_list.append(Percentile(percentile=normalized_percentile, value=p.value))
             normalized_preds.append(normalized_list)
         preds = normalized_preds
-        self._last_synthesizer_outputs = preds  # for comment
 
         valid_preds = [p for p in preds if p and len(p) >= 6]
         if not valid_preds:
@@ -275,7 +263,6 @@ class PerplexityHybridBot2025(ForecastBot):
         """)
         parsing_instructions = f"Valid options: {question.options}. Remove any extra prefixes."
         preds = await self._run_synthesizers(synth_prompt, PredictedOptionList, parsing_instructions)
-        self._last_synthesizer_outputs = preds  # for comment
         
         valid_preds = []
         for p in preds:
@@ -336,7 +323,7 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run PerplexityHybridBot2025")
+    parser = argparse.ArgumentParser(description="Run PerplexityHybridBot2025 (samcodes)")
     parser.add_argument(
         "--mode",
         type=str,
