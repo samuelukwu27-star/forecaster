@@ -38,7 +38,7 @@ class PerplexityHybridBot2025(ForecastBot):
         defaults = super()._llm_config_defaults()
         defaults.update({
             # Researcher: Perplexity with live web search
-            "researcher": "openrouter/perplexity/sonar-deep-research",
+            "researcher": "openrouter/openai/gpt-5",
 
             # Forecasting pipeline
             "default": "openrouter/openai/gpt-5",
