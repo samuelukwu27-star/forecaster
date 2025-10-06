@@ -48,7 +48,7 @@ class PerplexityHybridBot2025(ForecastBot):
             "opponent": "openrouter/openai/gpt-4o",
 
             "analyst_low": "openrouter/anthropic/claude-opus-4.1",
-            "analyst_high": "openrouter/openai/gpt-4o",
+            "analyst_high": "openrouter/openai/gpt-5",
 
             "analyst_geopolitical": "openrouter/anthropic/claude-3.5-sonnet",
             "analyst_tech": "openrouter/openai/gpt-5",
@@ -138,28 +138,45 @@ class PerplexityHybridBot2025(ForecastBot):
             Percentile 90: X
         """)
         preds = await self._run_synthesizers(synth_prompt, list[Percentile])
+        
+        # ✅ Normalize percentile values from 0–100 to 0–1
+        normalized_preds = []
+        for pred_list in preds:
+            if not pred_list:
+                normalized_preds.append(pred_list)
+                continue
+            normalized_list = []
+            for p in pred_list:
+                # Heuristic: if percentile > 1, assume it's in 0–100 scale
+                normalized_percentile = p.percentile / 100.0 if p.percentile > 1 else p.percentile
+                # Clamp to [0.0, 1.0] for safety
+                normalized_percentile = max(0.0, min(1.0, normalized_percentile))
+                normalized_list.append(Percentile(percentile=normalized_percentile, value=p.value))
+            normalized_preds.append(normalized_list)
+        preds = normalized_preds
+
         valid_preds = [p for p in preds if p and len(p) >= 6]
         if not valid_preds:
             mid = (question.lower_bound + question.upper_bound) / 2
-            # ✅ FIXED: Use keyword arguments for Percentile
+            # ✅ FIXED: Use 0.0–1.0 scale for percentile
             fallback_percentiles = [
-                Percentile(percentile=10, value=max(question.lower_bound, mid * 0.5)),
-                Percentile(percentile=20, value=max(question.lower_bound, mid * 0.7)),
-                Percentile(percentile=40, value=mid * 0.9),
-                Percentile(percentile=60, value=mid * 1.1),
-                Percentile(percentile=80, value=min(question.upper_bound, mid * 1.3)),
-                Percentile(percentile=90, value=min(question.upper_bound, mid * 1.5)),
+                Percentile(percentile=0.10, value=max(question.lower_bound, mid * 0.5)),
+                Percentile(percentile=0.20, value=max(question.lower_bound, mid * 0.7)),
+                Percentile(percentile=0.40, value=mid * 0.9),
+                Percentile(percentile=0.60, value=mid * 1.1),
+                Percentile(percentile=0.80, value=min(question.upper_bound, mid * 1.3)),
+                Percentile(percentile=0.90, value=min(question.upper_bound, mid * 1.5)),
             ]
             dist = NumericDistribution.from_question(fallback_percentiles, question)
             return ReasonedPrediction(prediction_value=dist, reasoning="Fallback due to parsing failure.")
         
-        all_vals = {10: [], 20: [], 40: [], 60: [], 80: [], 90: []}
+        all_vals = {0.10: [], 0.20: [], 0.40: [], 0.60: [], 0.80: [], 0.90: []}
         for pred in valid_preds:
             for p in pred:
                 if hasattr(p, 'percentile') and hasattr(p, 'value') and p.percentile in all_vals:
                     all_vals[p.percentile].append(p.value)
         aggregated = []
-        for pt in [10, 20, 40, 60, 80, 90]:
+        for pt in [0.10, 0.20, 0.40, 0.60, 0.80, 0.90]:
             vals = all_vals[pt]
             med = float(np.median(vals)) if vals else (question.lower_bound + question.upper_bound) / 2
             aggregated.append(Percentile(percentile=pt, value=med))
@@ -283,10 +300,10 @@ if __name__ == "__main__":
         )
     elif run_mode == "test_questions":
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/ ",
+            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/ ",
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/ ",
+            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/ ",
         ]
         bot.skip_previously_forecasted_questions = False
         questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
