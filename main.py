@@ -97,20 +97,17 @@ class PerplexityHybridBot2025(ForecastBot):
         prediction: ReasonedPrediction,
         research: str
     ) -> dict:
-        # Let base class handle prediction submission
         report = await super()._create_and_publish_report(question, prediction, research)
 
-        # Post comment if enabled
         if self.publish_research_as_comments and self.publish_reports_to_metaculus:
             try:
-                # Format final prediction
                 if isinstance(prediction.prediction_value, float):
                     final_pred_str = f"{prediction.prediction_value:.1%}"
                 elif isinstance(prediction.prediction_value, NumericDistribution):
                     median_val = prediction.prediction_value.get_percentile_value(0.5)
                     final_pred_str = f"Median: ~{median_val:.1f}"
                 elif isinstance(prediction.prediction_value, PredictedOptionList):
-                    top_opt = max(prediction.prediction_value, key=lambda x: x[1])
+                    top_opt = max(prediction.prediction_value.__root__, key=lambda x: x[1])
                     final_pred_str = f"Top: {top_opt[0]} ({top_opt[1]:.1%})"
                 else:
                     final_pred_str = str(prediction.prediction_value)
@@ -163,7 +160,7 @@ class PerplexityHybridBot2025(ForecastBot):
             final = float(np.median(valid))
         else:
             final = float(np.mean(valid)) if valid else 0.5
-        final = max(0.01, min(0.99, final))  # avoid overconfidence
+        final = max(0.01, min(0.99, final))
 
         reasoning = f"PRO:\n{pro}\n\nCON:\n{con}"
         return ReasonedPrediction(prediction_value=final, reasoning=reasoning)
@@ -194,7 +191,6 @@ class PerplexityHybridBot2025(ForecastBot):
         """)
         preds = await self._run_synthesizers(synth_prompt, list[Percentile])
         
-        # Normalize 0–100 → 0–1
         normalized_preds = []
         for pred_list in preds:
             if not pred_list:
@@ -266,11 +262,12 @@ class PerplexityHybridBot2025(ForecastBot):
         
         valid_preds = []
         for p in preds:
-            if p and isinstance(p, PredictedOptionList) and len(p) > 0:
+            if p and isinstance(p, PredictedOptionList):
                 try:
-                    pred_dict = dict(p)
-                    if all(opt in pred_dict for opt in question.options):
-                        valid_preds.append(pred_dict)
+                    if len(p.__root__) > 0:
+                        pred_dict = dict(p.__root__)
+                        if all(opt in pred_dict for opt in question.options):
+                            valid_preds.append(pred_dict)
                 except Exception as e:
                     logger.warning(f"MCQ parsing error: {e}")
                     continue
@@ -278,7 +275,7 @@ class PerplexityHybridBot2025(ForecastBot):
         if not valid_preds:
             uniform = [(opt, 1.0 / len(question.options)) for opt in question.options]
             return ReasonedPrediction(
-                prediction_value=PredictedOptionList(uniform),
+                prediction_value=PredictedOptionList(__root__=uniform),
                 reasoning="Fallback: uniform due to parsing failure."
             )
 
@@ -292,7 +289,7 @@ class PerplexityHybridBot2025(ForecastBot):
         total = sum(avg_probs.values())
         if total > 0:
             avg_probs = {k: v / total for k, v in avg_probs.items()}
-        final_pred = PredictedOptionList(list(avg_probs.items()))
+        final_pred = PredictedOptionList(__root__=list(avg_probs.items()))
         return ReasonedPrediction(prediction_value=final_pred, reasoning=evaluation)
 
     async def _run_synthesizers(self, prompt: str, output_type, additional_instructions: str = ""):
