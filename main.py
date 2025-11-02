@@ -46,7 +46,7 @@ class FinalTournamentBot2025(ForecastBot):
         defaults = super()._llm_config_defaults()
         # BOSS MODE: Include gpt-5 and claude-4.5 as requested
         defaults.update({
-            "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",  # ✅ Real
+            "researcher": "openrouter/openai/gpt-5",  # ✅ Real
             "default": "openrouter/openai/gpt-5",                                      # 🔜 Placeholder
             "parser": "openrouter/openai/gpt-4o-mini",                                # ✅ Real
 
