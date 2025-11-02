@@ -1,10 +1,9 @@
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Literal
-
-import numpy as np
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -22,114 +21,155 @@ from forecasting_tools import (
     clean_indents,
     structure_output,
 )
+from newsapi import NewsApiClient
 
 logger = logging.getLogger(__name__)
+NEWSAPI_API_KEY = os.getenv("NEWSAPI_KEY")
 
 
-class PerplexityHybridBot2025(ForecastBot):
+class FinalTournamentBot2025(ForecastBot):
     """
-    Hybrid forecasting bot using Perplexity (via OpenRouter) for live research
-    and a 5-model ensemble for robust prediction synthesis.
-    
-    Researcher: openrouter/thedrummer/cydonia-24b-v4.1
+    Final bot for Fall 2025 tournaments.
+    Includes GPT-5 and Claude-4.5 as requested (placeholders).
+    Uses real Perplexity for live research.
+    Forecasts on: minibench, 32813, 32831, colombia-wage-watch
+    Targets:
+      - Q578 / Q40159: 30–35% chance of ≥10% pop drop by 2100
+      - Q14333: 131 years oldest human by 2100
+      - Q22427: 50.8% for "0 or 1" new AI labs by 2030
     """
+
+    _max_concurrent_questions = 1
+    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     def _llm_config_defaults(self) -> dict[str, str]:
         defaults = super()._llm_config_defaults()
+        # BOSS MODE: Include gpt-5 and claude-4.5 as requested
         defaults.update({
-            # Researcher: Perplexity with live web search
-            "researcher": "openrouter/openai/gpt-5",
+            "researcher": "openrouter/perplexity/llama-3.1-sonar-large-128k-online",  # ✅ Real
+            "default": "openrouter/openai/gpt-5",                                      # 🔜 Placeholder
+            "parser": "openrouter/openai/gpt-4o-mini",                                # ✅ Real
 
-            # Forecasting pipeline
-            "default": "openrouter/openai/gpt-5",
-            "parser": "openrouter/openai/gpt-4o-mini",
+            "proponent": "openrouter/anthropic/claude-4.5-sonnet",                   # 🔜 Placeholder
+            "opponent": "openrouter/openai/gpt-5",                                   # 🔜 Placeholder
 
-            "proponent": "openrouter/anthropic/claude-3.5-sonnet",
-            "opponent": "openrouter/openai/gpt-4o",
+            "analyst_low": "openrouter/openai/gpt-4o-mini",                          # ✅ Real
+            "analyst_high": "openrouter/openai/gpt-5",                               # 🔜 Placeholder
 
-            "analyst_low": "openrouter/anthropic/claude-opus-4.1",
-            "analyst_high": "openrouter/openai/gpt-4o",
+            "analyst_geopolitical": "openrouter/anthropic/claude-4.5-sonnet",       # 🔜 Placeholder
+            "analyst_tech": "openrouter/openai/gpt-5",                              # 🔜 Placeholder
+            "analyst_climate": "openrouter/openai/gpt-4o-mini",                     # ✅ Real
+            "analyst_mc": "openrouter/openai/gpt-5",                                # 🔜 Placeholder
 
-            "analyst_geopolitical": "openrouter/anthropic/claude-3.5-sonnet",
-            "analyst_tech": "openrouter/openai/gpt-5",
-            "analyst_climate": "openrouter/openai/gpt-4o-mini",
-            "analyst_mc": "openrouter/openai/gpt-5",
-
-            # 5 Synthesizers for aggregation
-            "synthesizer_1": "openrouter/openai/gpt-5",
-            "synthesizer_2": "openrouter/anthropic/claude-sonnet-4.5",
-            "synthesizer_3": "openrouter/openai/gpt-5",
-            "synthesizer_4": "openrouter/anthropic/claude-sonnet-4",
-            "synthesizer_5": "openrouter/openai/gpt-4o-mini",
+            "synthesizer_1": "openrouter/openai/gpt-5",                             # 🔜 Placeholder
+            "synthesizer_2": "openrouter/anthropic/claude-4.5-sonnet",             # 🔜 Placeholder
+            "synthesizer_3": "openrouter/openai/gpt-4o",                            # ✅ Real fallback
         })
         return defaults
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
         self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
-        if len(self.synthesizer_keys) < 3:
-            logger.warning("Fewer than 3 synthesizers found — may reduce robustness.")
-        logger.info(f"Initialized with {len(self.synthesizer_keys)} synthesizers.")
+        logger.info(f"Intialized with synthesizers: {self.synthesizer_keys}")
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        researcher_llm = self.get_llm("researcher", "llm")
-        prompt = clean_indents(f"""
-            You are a forecasting research assistant.
-            Provide a concise, factual summary with recent data for:
-            Question: {question.question_text}
-            Resolution Criteria: {question.resolution_criteria}
-            Fine Print: {question.fine_print}
-            Today: {datetime.now().strftime('%Y-%m-%d')}
-            Focus on trends, breakthroughs, or events that could affect the outcome.
-            If the question is highly speculative or about the distant future with no current data, state that clearly.
-        """)
-        research = await researcher_llm.invoke(prompt)
-        logger.info(f"Research for {question.page_url}:\n{research}")
-        return research
+        async with self._concurrency_limiter:
+            researcher_llm = self.get_llm("researcher", "llm")
+            prompt = clean_indents(f"""
+                You are an assistant to a superforecaster.
+                Question: {question.question_text}
+                Resolution Criteria: {question.resolution_criteria}
+                Fine Print: {question.fine_print}
+                Provide a concise, factual summary with recent data.
+            """)
+            research = await researcher_llm.invoke(prompt)
+
+            if NEWSAPI_API_KEY:
+                try:
+                    articles = self.newsapi_client.get_everything(
+                        q=question.question_text, language='en', sort_by='relevancy', page_size=3
+                    )
+                    if articles and articles.get('articles'):
+                        news = "\n".join([f"- {a['title']}" for a in articles['articles'][:3]])
+                        research += f"\n\nRecent News:\n{news}"
+                except Exception as e:
+                    logger.warning(f"NewsAPI failed: {e}")
+            return research
+
+    # --- FORECASTING METHODS (from FallTemplateBot2025 structure) ---
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        pro = await self.get_llm("proponent", "llm").invoke(
-            clean_indents(f"Argue YES: {question.question_text}\n{research}")
-        )
-        con = await self.get_llm("opponent", "llm").invoke(
-            clean_indents(f"Argue NO: {question.question_text}\n{research}")
-        )
-        synth_prompt = clean_indents(f"""
-            Judge this debate.
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
             Question: {question.question_text}
-            Criteria: {question.resolution_criteria}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
             Fine Print: {question.fine_print}
-            Today: {datetime.now().strftime('%Y-%m-%d')}
             Research: {research}
-            PRO (YES): {pro}
-            CON (NO): {con}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            (a) Time until resolution
+            (b) Status quo outcome
+            (c) Scenario for No
+            (d) Scenario for Yes
             Final output: "Probability: ZZ%"
         """)
-        preds = await self._run_synthesizers(synth_prompt, BinaryPrediction)
-        valid = [p.prediction_in_decimal for p in preds if p]
-        final = max(0.01, min(0.99, float(np.median(valid)) if valid else 0.5))
-        reasoning = f"PRO:\n{pro}\n\nCON:\n{con}"
-        return ReasonedPrediction(prediction_value=final, reasoning=reasoning)
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        pred: BinaryPrediction = await structure_output(
+            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
+        )
+        decimal_pred = max(0.01, min(0.99, pred.prediction_in_decimal))
+        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+
+    async def _run_forecast_on_multiple_choice(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
+            Question: {question.question_text}
+            Options: {question.options}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Research: {research}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            (a) Time until resolution
+            (b) Status quo outcome
+            (c) Unexpected scenario
+            Final output:
+            {chr(10).join([f"{opt}: XX%" for opt in question.options])}
+        """)
+        parsing_instructions = f"Valid options: {question.options}"
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        pred: PredictedOptionList = await structure_output(
+            reasoning, PredictedOptionList, self.get_llm("parser", "llm"), parsing_instructions
+        )
+        return ReasonedPrediction(prediction_value=pred, reasoning=reasoning)
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        low = await self.get_llm("analyst_low", "llm").invoke(
-            f"Low scenario: {question.question_text}\n{research}"
-        )
-        high = await self.get_llm("analyst_high", "llm").invoke(
-            f"High scenario: {question.question_text}\n{research}"
-        )
-        synth_prompt = clean_indents(f"""
-            Estimate percentiles for: {question.question_text}
+        low_msg, high_msg = self._create_upper_and_lower_bound_messages(question)
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
             Units: {question.unit_of_measure or 'inferred'}
-            Bounds: [{question.lower_bound}, {question.upper_bound}]
-            Low: {low}
-            High: {high}
             Research: {research}
-            Output ONLY:
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            {low_msg}
+            {high_msg}
+            (a) Time until resolution
+            (b) Outcome if nothing changed
+            (c) Outcome if trend continues
+            (d) Expert/market expectations
+            (e) Low-outcome scenario
+            (f) High-outcome scenario
+            Final output:
             Percentile 10: X
             Percentile 20: X
             Percentile 40: X
@@ -137,117 +177,21 @@ class PerplexityHybridBot2025(ForecastBot):
             Percentile 80: X
             Percentile 90: X
         """)
-        preds = await self._run_synthesizers(synth_prompt, list[Percentile])
-        
-        # ✅ Normalize percentile values from 0–100 to 0–1
-        normalized_preds = []
-        for pred_list in preds:
-            if not pred_list:
-                normalized_preds.append(pred_list)
-                continue
-            normalized_list = []
-            for p in pred_list:
-                # Heuristic: if percentile > 1, assume it's in 0–100 scale
-                normalized_percentile = p.percentile / 100.0 if p.percentile > 1 else p.percentile
-                # Clamp to [0.0, 1.0] for safety
-                normalized_percentile = max(0.0, min(1.0, normalized_percentile))
-                normalized_list.append(Percentile(percentile=normalized_percentile, value=p.value))
-            normalized_preds.append(normalized_list)
-        preds = normalized_preds
-
-        valid_preds = [p for p in preds if p and len(p) >= 6]
-        if not valid_preds:
-            mid = (question.lower_bound + question.upper_bound) / 2
-            # ✅ FIXED: Use 0.0–1.0 scale for percentile
-            fallback_percentiles = [
-                Percentile(percentile=0.10, value=max(question.lower_bound, mid * 0.5)),
-                Percentile(percentile=0.20, value=max(question.lower_bound, mid * 0.7)),
-                Percentile(percentile=0.40, value=mid * 0.9),
-                Percentile(percentile=0.60, value=mid * 1.1),
-                Percentile(percentile=0.80, value=min(question.upper_bound, mid * 1.3)),
-                Percentile(percentile=0.90, value=min(question.upper_bound, mid * 1.5)),
-            ]
-            dist = NumericDistribution.from_question(fallback_percentiles, question)
-            return ReasonedPrediction(prediction_value=dist, reasoning="Fallback due to parsing failure.")
-        
-        all_vals = {0.10: [], 0.20: [], 0.40: [], 0.60: [], 0.80: [], 0.90: []}
-        for pred in valid_preds:
-            for p in pred:
-                if hasattr(p, 'percentile') and hasattr(p, 'value') and p.percentile in all_vals:
-                    all_vals[p.percentile].append(p.value)
-        aggregated = []
-        for pt in [0.10, 0.20, 0.40, 0.60, 0.80, 0.90]:
-            vals = all_vals[pt]
-            med = float(np.median(vals)) if vals else (question.lower_bound + question.upper_bound) / 2
-            aggregated.append(Percentile(percentile=pt, value=med))
-        dist = NumericDistribution.from_question(aggregated, question)
-        reasoning = f"LOW:\n{low}\n\nHIGH:\n{high}"
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        percentile_list: list[Percentile] = await structure_output(
+            reasoning, list[Percentile], model=self.get_llm("parser", "llm")
+        )
+        dist = NumericDistribution.from_question(percentile_list, question)
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
-    async def _run_forecast_on_multiple_choice(
-        self, question: MultipleChoiceQuestion, research: str
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        text = question.question_text.lower()
-        domain = "tech" if any(kw in text for kw in ["ai", "lab", "model", "algorithm"]) else "general"
-        analyst_key = f"analyst_{domain}"
-        if analyst_key not in self._llms:
-            analyst_key = "analyst_mc"
-        evaluation = await self.get_llm(analyst_key, "llm").invoke(clean_indents(f"""
-            Evaluate options for: {question.question_text}
-            Options: {question.options}
-            Research: {research}
-        """))
-        synth_prompt = clean_indents(f"""
-            Assign probabilities to EXACT options: {question.options}
-            Evaluation: {evaluation}
-            Research: {research}
-            Today: {datetime.now().strftime('%Y-%m-%d')}
-            Output ONLY:
-            {chr(10).join([f"{opt}: XX%" for opt in question.options])}
-        """)
-        parsing_instructions = f"Valid options: {question.options}. Remove any extra prefixes."
-        preds = await self._run_synthesizers(synth_prompt, PredictedOptionList, parsing_instructions)
-        
-        valid_preds = []
-        for p in preds:
-            if p and isinstance(p, PredictedOptionList) and len(p) > 0:
-                try:
-                    pred_dict = dict(p)
-                    if all(opt in pred_dict for opt in question.options):
-                        valid_preds.append(pred_dict)
-                except Exception as e:
-                    logger.warning(f"MCQ parsing error: {e}")
-                    continue
-
-        if not valid_preds:
-            uniform = [(opt, 1.0 / len(question.options)) for opt in question.options]
-            return ReasonedPrediction(
-                prediction_value=PredictedOptionList(uniform),
-                reasoning="Fallback: uniform due to parsing failure."
-            )
-
-        avg_probs = {}
-        for opt in question.options:
-            probs = [pred.get(opt, 0) for pred in valid_preds]
-            avg_probs[opt] = float(np.mean(probs))
-        total = sum(avg_probs.values())
-        if total > 0:
-            avg_probs = {k: v / total for k, v in avg_probs.items()}
-        final_pred = PredictedOptionList(list(avg_probs.items()))
-        return ReasonedPrediction(prediction_value=final_pred, reasoning=evaluation)
-
-    async def _run_synthesizers(self, prompt: str, output_type, additional_instructions: str = ""):
-        tasks = []
-        for key in self.synthesizer_keys:
-            llm = self.get_llm(key, "llm")
-            resp = await llm.invoke(prompt)
-            if output_type == PredictedOptionList:
-                task = structure_output(resp, output_type, self.get_llm("parser", "llm"), additional_instructions=additional_instructions)
-            else:
-                task = structure_output(resp, output_type, self.get_llm("parser", "llm"))
-            tasks.append(task)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return [r for r in results if not isinstance(r, Exception)]
+    def _create_upper_and_lower_bound_messages(
+        self, question: NumericQuestion
+    ) -> tuple[str, str]:
+        low = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
+        high = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
+        low_msg = f"The outcome cannot be lower than {low}." if not question.open_lower_bound else f"The question creator thinks it's unlikely to be below {low}."
+        high_msg = f"The outcome cannot be higher than {high}." if not question.open_upper_bound else f"The question creator thinks it's unlikely to be above {high}."
+        return low_msg, high_msg
 
 
 # ======================
@@ -259,55 +203,27 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
     litellm_logger = logging.getLogger("LiteLLM")
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run PerplexityHybridBot2025")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["tournament", "metaculus_cup", "test_questions"],
-        default="tournament",
-        help="Run mode",
-    )
-    args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    if not os.getenv("OPENROUTER_API_KEY"):
+        logger.error("❌ OPENROUTER_API_KEY is required")
+        exit(1)
 
-    bot = PerplexityHybridBot2025(
+    bot = FinalTournamentBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=1,
+        predictions_per_research_report=5,  # ← Median of 5 forecasts
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
     )
 
-    if run_mode == "tournament":
-        seasonal = asyncio.run(
-            bot.forecast_on_tournament(MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True)
-        )
-        minibench = asyncio.run(
-            bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
-        )
-        market_pulse = asyncio.run(
-            bot.forecast_on_tournament("market-pulse-25q4", return_exceptions=True)
-        )
-        reports = seasonal + minibench + market_pulse
-    elif run_mode == "metaculus_cup":
-        bot.skip_previously_forecasted_questions = False
-        reports = asyncio.run(
-            bot.forecast_on_tournament(MetaculusApi.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
-        )
-    elif run_mode == "test_questions":
-        EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/ ",
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/ ",
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/ ",
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/ ",
-        ]
-        bot.skip_previously_forecasted_questions = False
-        questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
-        reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+    TOURNAMENT_IDS = ["minibench", "32813", "32831", "colombia-wage-watch"]
+    all_reports = []
+    for tid in TOURNAMENT_IDS:
+        logger.info(f"▶️ Forecasting on tournament: {tid}")
+        reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
+        all_reports.extend(reports)
 
-    bot.log_report_summary(reports)
-    logger.info("✅ Perplexity Hybrid run completed.")
+    bot.log_report_summary(all_reports)
+    logger.info("✅ Run completed.")
