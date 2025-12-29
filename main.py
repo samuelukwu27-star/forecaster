@@ -2,9 +2,20 @@ import argparse
 import asyncio
 import logging
 import os
+import textwrap
+import re
 from datetime import datetime
-from typing import Literal
+from typing import List, Literal, Optional
 
+# AskNews integration (preferred official SDK; fallback to requests if unavailable)
+try:
+    from asknews_sdk import AskNewsSDK
+    ASKNEWS_SDK_AVAILABLE = True
+except ImportError:
+    ASKNEWS_SDK_AVAILABLE = False
+    import requests
+
+# Forecasting tools
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -17,26 +28,101 @@ from forecasting_tools import (
     Percentile,
     BinaryPrediction,
     PredictedOptionList,
+    PredictedOption,
     ReasonedPrediction,
     clean_indents,
     structure_output,
 )
-from newsapi import NewsApiClient
 
-logger = logging.getLogger(__name__)
-NEWSAPI_API_KEY = os.getenv("NEWSAPI_KEY")
+# -----------------------------
+# Helper: Pure-Python median
+# -----------------------------
+def median(lst: List[float]) -> float:
+    if not lst:
+        raise ValueError("median() arg is an empty sequence")
+    sorted_lst = sorted(lst)
+    n = len(sorted_lst)
+    mid = n // 2
+    if n % 2 == 0:
+        return (sorted_lst[mid - 1] + sorted_lst[mid]) / 2.0
+    else:
+        return float(sorted_lst[mid])
+
+
+# -----------------------------
+# ASKNEWS QUERY BUILDER (≤ 397 chars — robust)
+# -----------------------------
+def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
+    """
+    Build a safe AskNews query, capped at max_chars.
+    Strategy:
+      1. Prioritize question_text
+      2. Add background only if space permits
+      3. Strip URLs, normalize whitespace
+    """
+    q = question.question_text.strip()
+    bg = (question.background_info or "").strip()
+
+    # Clean noise
+    q = re.sub(r"http\S+", "", q)
+    bg = re.sub(r"http\S+", "", bg)
+    q = re.sub(r"\s+", " ", q).strip()
+    bg = re.sub(r"\s+", " ", bg).strip()
+
+    # Case 1: Question fits alone
+    if len(q) <= max_chars:
+        if not bg:
+            return q
+        candidate = f"{q} — {bg}"
+        if len(candidate) <= max_chars:
+            return candidate
+        space_for_bg = max_chars - len(q) - 3  # " — "
+        if space_for_bg > 10:
+            bg_part = textwrap.shorten(bg, width=space_for_bg, placeholder="…")
+            return f"{q} — {bg_part}"
+        else:
+            return q
+
+    # Case 2: Question too long → use first sentence
+    first_sent = q.split('.')[0].strip()
+    if len(first_sent) > max_chars:
+        return textwrap.shorten(first_sent, width=max_chars, placeholder="…")
+
+    remaining = max_chars - len(first_sent) - 3
+    if remaining > 10 and bg:
+        bg_part = textwrap.shorten(bg, width=remaining, placeholder="…")
+        combo = f"{first_sent} — {bg_part}"
+        if len(combo) <= max_chars:
+            return combo
+
+    return textwrap.shorten(q, width=max_chars, placeholder="…")
+
+
+# -----------------------------
+# Logging & AskNews Setup
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("FinalTournamentBot2025")
+
+ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
+ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET")
+
+if not (ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET):
+    raise EnvironmentError("ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET must be set.")
 
 
 class FinalTournamentBot2025(ForecastBot):
     """
     Final bot for Fall 2025 tournaments.
-    Includes GPT-5 and Claude-4.5 as requested (placeholders).
-    Uses real Perplexity for live research.
-    Forecasts on: minibench, 32813, 32831, colombia-wage-watch
-    Targets:
-      - Q578 / Q40159: 30–35% chance of ≥10% pop drop by 2100
-      - Q14333: 131 years oldest human by 2100
-      - Q22427: 50.8% for "0 or 1" new AI labs by 2030
+    Uses **AskNews** for live, high-quality news research.
+    Includes GPT-5 and Claude-4.5 (placeholders as requested).
+    Targets key questions:
+      - Q578 / Q40159: ≥10% pop drop by 2100 → 30–35%
+      - Q14333: Oldest human → 131 years by 2100
+      - Q22427: "0 or 1" new AI labs by 2030 → 50.8%
     """
 
     _max_concurrent_questions = 1
@@ -44,37 +130,102 @@ class FinalTournamentBot2025(ForecastBot):
 
     def _llm_config_defaults(self) -> dict[str, str]:
         defaults = super()._llm_config_defaults()
-        # BOSS MODE: Include gpt-5 and claude-4.5 as requested
         defaults.update({
-            "researcher": "openrouter/openai/gpt-5",  # ✅ Real
-            "default": "openrouter/openai/gpt-5",                                      # 🔜 Placeholder
-            "parser": "openrouter/openai/gpt-4o-mini",                                # ✅ Real
+            "researcher": "openrouter/openai/gpt-5",
+            "default": "openrouter/openai/gpt-5",
+            "parser": "openrouter/openai/gpt-4o-mini",
 
-            "proponent": "openrouter/anthropic/claude-4.5-sonnet",                   # 🔜 Placeholder
-            "opponent": "openrouter/openai/gpt-5",                                   # 🔜 Placeholder
+            "proponent": "openrouter/anthropic/claude-4.5-sonnet",
+            "opponent": "openrouter/openai/gpt-5",
 
-            "analyst_low": "openrouter/openai/gpt-4o-mini",                          # ✅ Real
-            "analyst_high": "openrouter/openai/gpt-5",                               # 🔜 Placeholder
+            "analyst_low": "openrouter/openai/gpt-4o-mini",
+            "analyst_high": "openrouter/openai/gpt-5",
 
-            "analyst_geopolitical": "openrouter/anthropic/claude-4.5-sonnet",       # 🔜 Placeholder
-            "analyst_tech": "openrouter/openai/gpt-5",                              # 🔜 Placeholder
-            "analyst_climate": "openrouter/openai/gpt-4o-mini",                     # ✅ Real
-            "analyst_mc": "openrouter/openai/gpt-5",                                # 🔜 Placeholder
+            "analyst_geopolitical": "openrouter/anthropic/claude-4.5-sonnet",
+            "analyst_tech": "openrouter/openai/gpt-5",
+            "analyst_climate": "openrouter/openai/gpt-4o-mini",
+            "analyst_mc": "openrouter/openai/gpt-5",
 
-            "synthesizer_1": "openrouter/openai/gpt-5",                             # 🔜 Placeholder
-            "synthesizer_2": "openrouter/anthropic/claude-4.5-sonnet",             # 🔜 Placeholder
-            "synthesizer_3": "openrouter/openai/gpt-4o",                            # ✅ Real fallback
+            "synthesizer_1": "openrouter/openai/gpt-5",
+            "synthesizer_2": "openrouter/anthropic/claude-4.5-sonnet",
+            "synthesizer_3": "openrouter/openai/gpt-4o",
         })
         return defaults
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
-        self.synthesizer_keys = [k for k in self._llms.keys() if k.startswith("synthesizer")]
-        logger.info(f"Intialized with synthesizers: {self.synthesizer_keys}")
+        self._asknews_client = None
+        logger.info("Intialized FinalTournamentBot2025 (AskNews-powered)")
+
+    def _get_asknews_client(self):
+        """Lazy-init AskNews client (thread-safe for sync call in executor)"""
+        if self._asknews_client is not None:
+            return self._asknews_client
+
+        if ASKNEWS_SDK_AVAILABLE:
+            self._asknews_client = AskNewsSDK(
+                client_id=ASKNEWS_CLIENT_ID,
+                client_secret=ASKNEWS_CLIENT_SECRET
+            )
+        else:
+            # Fallback: minimal OAuth2 + requests
+            auth_url = "https://api.asknews.app/v1/oauth/token"
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": ASKNEWS_CLIENT_ID,
+                "client_secret": ASKNEWS_CLIENT_SECRET
+            }
+            resp = requests.post(auth_url, data=data)
+            resp.raise_for_status()
+            token = resp.json()["access_token"]
+            self._asknews_client = {"token": token}
+        return self._asknews_client
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+
+            # --- ✅ SAFE ASKNEWS QUERY (≤ 397 CHARS) ---
+            query = build_asknews_query(question)
+            logger.debug(f"AskNews query ({len(query)} chars): {repr(query)}")
+
+            asknews_summary = "[AskNews research pending]"
+
+            try:
+                loop = asyncio.get_event_loop()
+                asknews_response = await loop.run_in_executor(
+                    None,
+                    self._sync_asknews_search,
+                    query
+                )
+
+                if ASKNEWS_SDK_AVAILABLE:
+                    stories = asknews_response.stories
+                else:
+                    stories = asknews_response.get("data", {}).get("stories", [])
+
+                if not stories:
+                    asknews_summary = "[AskNews: No recent stories found]"
+                else:
+                    snippets = []
+                    for i, story in enumerate(stories[:5]):
+                        if ASKNEWS_SDK_AVAILABLE:
+                            title = story.title
+                            summary = story.summary or story.text[:200]
+                        else:
+                            title = story.get("title", "Untitled")
+                            summary = (story.get("summary") or story.get("text", ""))[:200]
+                        snippet = f"[{i+1}] {title}: {textwrap.shorten(summary, width=180, placeholder='…')}"
+                        snippets.append(snippet)
+                    asknews_summary = "\n".join(snippets)
+                    logger.info(f"AskNews succeeded with {len(stories)} stories")
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"AskNews research failed: {error_msg}")
+                asknews_summary = f"[AskNews error: {error_msg}]"
+
+            # --- LLM RESEARCH (unchanged logic) ---
             researcher_llm = self.get_llm("researcher", "llm")
             prompt = clean_indents(f"""
                 You are an assistant to a superforecaster.
@@ -83,21 +234,45 @@ class FinalTournamentBot2025(ForecastBot):
                 Fine Print: {question.fine_print}
                 Provide a concise, factual summary with recent data.
             """)
-            research = await researcher_llm.invoke(prompt)
+            try:
+                llm_research = await researcher_llm.invoke(prompt)
+            except Exception as e:
+                llm_research = f"[LLM research failed: {str(e)}]"
 
-            if NEWSAPI_API_KEY:
-                try:
-                    articles = self.newsapi_client.get_everything(
-                        q=question.question_text, language='en', sort_by='relevancy', page_size=3
-                    )
-                    if articles and articles.get('articles'):
-                        news = "\n".join([f"- {a['title']}" for a in articles['articles'][:3]])
-                        research += f"\n\nRecent News:\n{news}"
-                except Exception as e:
-                    logger.warning(f"NewsAPI failed: {e}")
-            return research
+            return (
+                f"--- ASKNEWS LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
+                f"--- LLM RESEARCH SUMMARY ---\n{llm_research}"
+            )
 
-    # --- FORECASTING METHODS (from FallTemplateBot2025 structure) ---
+    def _sync_asknews_search(self, query: str):
+        """Sync helper for AskNews (called in thread pool)"""
+        client = self._get_asknews_client()
+
+        if ASKNEWS_SDK_AVAILABLE:
+            return client.stories.search(
+                query=query,
+                n_articles=5,
+                return_stories=True,
+                return_hits=False
+            )
+        else:
+            # Manual HTTP fallback
+            headers = {"Authorization": f"Bearer {client['token']}"}
+            params = {
+                "q": query,
+                "n_articles": 5,
+                "sort": "relevance"
+            }
+            resp = requests.get(
+                "https://api.asknews.app/v1/stories",
+                headers=headers,
+                params=params,
+                timeout=15
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    # --- FORECASTING METHODS (unchanged logic — clean, structured) ---
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
@@ -193,19 +368,93 @@ class FinalTournamentBot2025(ForecastBot):
         high_msg = f"The outcome cannot be higher than {high}." if not question.open_upper_bound else f"The question creator thinks it's unlikely to be above {high}."
         return low_msg, high_msg
 
+    # -----------------------------
+    # Override _make_prediction for committee + median (5 predictions → median)
+    # -----------------------------
+    async def _make_prediction(self, question: MetaculusQuestion, research: str):
+        # Use 5 identical forecasters (as `predictions_per_research_report=5`)
+        predictions = []
+        reasonings = []
 
-# ======================
+        for _ in range(5):
+            try:
+                if isinstance(question, BinaryQuestion):
+                    pred = await self._run_forecast_on_binary(question, research)
+                elif isinstance(question, MultipleChoiceQuestion):
+                    pred = await self._run_forecast_on_multiple_choice(question, research)
+                elif isinstance(question, NumericQuestion):
+                    pred = await self._run_forecast_on_numeric(question, research)
+                else:
+                    raise ValueError(f"Unsupported question type: {type(question)}")
+                predictions.append(pred.prediction_value)
+                reasonings.append(pred.reasoning)
+            except Exception as e:
+                logger.error(f"Forecaster failed: {e}")
+                continue
+
+        if not predictions:
+            raise RuntimeError("All 5 forecasters failed.")
+
+        # Median aggregation (same as template)
+        if isinstance(question, BinaryQuestion):
+            median_val = median([p for p in predictions])
+            final_pred = ReasonedPrediction(prediction_value=median_val, reasoning=" | ".join(reasonings))
+        elif isinstance(question, MultipleChoiceQuestion):
+            options = question.options
+            avg_probs = {}
+            for opt in options:
+                option_probs = []
+                for p in predictions:
+                    pred_dict = {po.option_name: po.probability for po in p.predicted_options}
+                    option_probs.append(pred_dict.get(opt, 0.0))
+                avg_probs[opt] = median(option_probs)
+            total = sum(avg_probs.values())
+            if total > 0:
+                avg_probs = {k: v / total for k, v in avg_probs.items()}
+            predicted_options_list = [
+                PredictedOption(option_name=opt, probability=prob)
+                for opt, prob in avg_probs.items()
+            ]
+            final_pred = ReasonedPrediction(
+                prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
+                reasoning=" | ".join(reasonings)
+            )
+        elif isinstance(question, NumericQuestion):
+            target_pts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+            median_percentiles = []
+            for pt in target_pts:
+                vals = []
+                for p in predictions:
+                    for item in p.declared_percentiles:
+                        if abs(item.percentile - pt) < 0.01:
+                            vals.append(item.value)
+                            break
+                median_val = median(vals) if vals else 0.0
+                median_percentiles.append(Percentile(percentile=pt, value=median_val))
+            final_dist = NumericDistribution.from_question(median_percentiles, question)
+            final_pred = ReasonedPrediction(prediction_value=final_dist, reasoning=" | ".join(reasonings))
+        else:
+            final_pred = ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
+
+        return final_pred
+
+
+# -----------------------------
 # MAIN
-# ======================
-
+# -----------------------------
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
     litellm_logger = logging.getLogger("LiteLLM")
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
+
+    parser = argparse.ArgumentParser(description="Run FinalTournamentBot2025 (AskNews + GPT-5/Claude-4.5)")
+    parser.add_argument(
+        "--tournament-ids",
+        nargs="+",
+        type=str,
+        default=["ACX2026", "minibench", "32916", "market-pulse-26q1"],
+    )
+    args = parser.parse_args()
 
     if not os.getenv("OPENROUTER_API_KEY"):
         logger.error("❌ OPENROUTER_API_KEY is required")
@@ -218,12 +467,11 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
     )
 
-    TOURNAMENT_IDS = ["minibench", "32813", "32831", "colombia-wage-watch"]
     all_reports = []
-    for tid in TOURNAMENT_IDS:
+    for tid in args.tournament_ids:
         logger.info(f"▶️ Forecasting on tournament: {tid}")
         reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
         all_reports.extend(reports)
 
     bot.log_report_summary(all_reports)
-    logger.info("✅ Run completed.")
+    logger.info("✅ FinalTournamentBot2025 (AskNews-powered) run completed.")
