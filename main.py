@@ -117,7 +117,7 @@ if not (ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET):
 class FinalTournamentBot2025(ForecastBot):
     """
     Final bot for Fall 2025 tournaments.
-    Uses **AskNews** for live, high-quality news research.
+    Uses **AskNews** for live, high-quality news research (SDK v1.3+ compatible).
     Includes GPT-5 and Claude-4.5 (placeholders as requested).
     Targets key questions:
       - Q578 / Q40159: ≥10% pop drop by 2100 → 30–35%
@@ -156,6 +156,9 @@ class FinalTournamentBot2025(ForecastBot):
         super().__init__(*args, **kwargs)
         self._asknews_client = None
         logger.info("Intialized FinalTournamentBot2025 (AskNews-powered)")
+        if ASKNEWS_SDK_AVAILABLE:
+            import asknews_sdk
+            logger.info(f"AskNews SDK version: {asknews_sdk.__version__}")
 
     def _get_asknews_client(self):
         """Lazy-init AskNews client (thread-safe for sync call in executor)"""
@@ -163,9 +166,13 @@ class FinalTournamentBot2025(ForecastBot):
             return self._asknews_client
 
         if ASKNEWS_SDK_AVAILABLE:
+            # ✅ Disable AI integrations to avoid OpenAI key warnings
             self._asknews_client = AskNewsSDK(
                 client_id=ASKNEWS_CLIENT_ID,
-                client_secret=ASKNEWS_CLIENT_SECRET
+                client_secret=ASKNEWS_CLIENT_SECRET,
+                enable_openai=False,
+                enable_anthropic=False,
+                enable_gemini=False,
             )
         else:
             # Fallback: minimal OAuth2 + requests
@@ -193,16 +200,11 @@ class FinalTournamentBot2025(ForecastBot):
 
             try:
                 loop = asyncio.get_event_loop()
-                asknews_response = await loop.run_in_executor(
+                stories = await loop.run_in_executor(
                     None,
                     self._sync_asknews_search,
                     query
                 )
-
-                if ASKNEWS_SDK_AVAILABLE:
-                    stories = asknews_response.stories
-                else:
-                    stories = asknews_response.get("data", {}).get("stories", [])
 
                 if not stories:
                     asknews_summary = "[AskNews: No recent stories found]"
@@ -210,12 +212,12 @@ class FinalTournamentBot2025(ForecastBot):
                     snippets = []
                     for i, story in enumerate(stories[:5]):
                         if ASKNEWS_SDK_AVAILABLE:
-                            title = story.title
-                            summary = story.summary or story.text[:200]
+                            title = getattr(story, "title", "Untitled")
+                            text = getattr(story, "text", "")[:200]
                         else:
                             title = story.get("title", "Untitled")
-                            summary = (story.get("summary") or story.get("text", ""))[:200]
-                        snippet = f"[{i+1}] {title}: {textwrap.shorten(summary, width=180, placeholder='…')}"
+                            text = (story.get("text") or "")[:200]
+                        snippet = f"[{i+1}] {title}: {textwrap.shorten(text, width=180, placeholder='…')}"
                         snippets.append(snippet)
                     asknews_summary = "\n".join(snippets)
                     logger.info(f"AskNews succeeded with {len(stories)} stories")
@@ -245,32 +247,42 @@ class FinalTournamentBot2025(ForecastBot):
             )
 
     def _sync_asknews_search(self, query: str):
-        """Sync helper for AskNews (called in thread pool)"""
+        """Sync helper for AskNews (SDK v1.3+ compatible, no AI features)"""
         client = self._get_asknews_client()
 
         if ASKNEWS_SDK_AVAILABLE:
-            return client.stories.search(
+            # ✅ CORRECT USAGE: client.news.search_stories (not client.stories.search)
+            response = client.news.search_stories(
                 query=query,
                 n_articles=5,
-                return_stories=True,
-                return_hits=False
+                return_type="news",          # only news articles
+                use_neural_search=False,     # disable AI ranking
+                return_story_text=True,      # include article text
+                return_story_summary=False,  # skip AI summary (avoids OpenAI)
             )
+            # Extract stories list safely
+            news_data = getattr(response, "data", {})
+            return news_data.get("news", [])
         else:
-            # Manual HTTP fallback
+            # Manual HTTP fallback (same API endpoint as SDK uses)
             headers = {"Authorization": f"Bearer {client['token']}"}
             params = {
                 "q": query,
                 "n_articles": 5,
-                "sort": "relevance"
+                "sort": "relevance",
+                "return_type": "news",
+                "use_neural_search": "false",
+                "return_story_text": "true",
+                "return_story_summary": "false"
             }
             resp = requests.get(
-                "https://api.asknews.app/v1/stories",
+                "https://api.asknews.app/v1/news",
                 headers=headers,
                 params=params,
                 timeout=15
             )
             resp.raise_for_status()
-            return resp.json()
+            return resp.json().get("data", {}).get("news", [])
 
     # --- FORECASTING METHODS (unchanged logic — clean, structured) ---
 
