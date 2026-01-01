@@ -44,6 +44,8 @@ def median(lst: List[Union[float, int]]) -> float:
         if isinstance(x, (int, float)) and not isinstance(x, bool)
     ]
     if not numeric_vals:
+        # Return a safe fallback (e.g., 0.5) or raise strict error depending on pref
+        # Raising error here is handled by the caller's try/except
         raise ValueError("median() arg contains no numeric values")
     
     sorted_vals = sorted(numeric_vals)
@@ -56,7 +58,7 @@ def median(lst: List[Union[float, int]]) -> float:
 
 
 # -----------------------------
-# ASKNEWS QUERY BUILDER (≤ 397 chars — robust)
+# ASKNEWS QUERY BUILDER
 # -----------------------------
 def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
     q = (question.question_text or "").strip()
@@ -121,10 +123,10 @@ class FinalTournamentBot2025(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "researcher": "openrouter/openai/gpt-4o",  # Fallback to 4o if 5 unavailable
+            "researcher": "openrouter/openai/gpt-4o", 
             "default": "openrouter/openai/gpt-4o",
             "parser": "openrouter/openai/gpt-4o-mini",
-            "proponent": "openrouter/anthropic/claude-3.5-sonnet", # Updated to current valid models
+            "proponent": "openrouter/anthropic/claude-3.5-sonnet", 
             "opponent": "openrouter/openai/gpt-4o",
             "analyst_low": "openrouter/openai/gpt-4o-mini",
             "analyst_high": "openrouter/openai/gpt-4o",
@@ -235,27 +237,40 @@ class FinalTournamentBot2025(ForecastBot):
             )
 
     def _sync_asknews_search(self, query: str) -> List[Any]:
-        """✅ Robust search that works on all AskNews SDK versions and fallback."""
+        """✅ Robust search: Tries 'search_news' (v1+) then 'search_stories' (v0.7)."""
         client = self._get_asknews_client()
 
         if ASKNEWS_SDK_AVAILABLE:
             try:
-                response = client.news.search_stories(
-                    query=query,
-                    n_articles=5,
-                    return_type="news",
-                    use_neural_search=False,
-                    return_story_text=True,
-                    return_story_summary=False,
-                )
+                # 1. Try NEW SDK method (v1.0+)
+                if hasattr(client.news, "search_news"):
+                    response = client.news.search_news(
+                        query=query,
+                        n_articles=5,
+                        return_type="news",
+                        method="kw", # v1+ specific
+                        return_story_text=True
+                    )
+                # 2. Try OLD SDK method (v0.7)
+                elif hasattr(client.news, "search_stories"):
+                    response = client.news.search_stories(
+                        query=query,
+                        n_articles=5,
+                        return_type="news",
+                        use_neural_search=False,
+                        return_story_text=True,
+                        return_story_summary=False,
+                    )
+                else:
+                    raise AttributeError("AskNews client has neither search_news nor search_stories")
                 
-                # FIX: Handle SDK v0.7+ Pydantic models vs Older Dicts
+                # Handle response formats
                 if hasattr(response, "news"):
                     return response.news
                 if hasattr(response, "as_dict"):
                     return response.as_dict().get("news", [])
                 
-                # Fallback for dict-like response or older wrappers
+                # Fallback for dict-like response
                 data = getattr(response, "data", response if isinstance(response, dict) else {})
                 return data.get("news", []) if isinstance(data, dict) else []
             
@@ -272,8 +287,7 @@ class FinalTournamentBot2025(ForecastBot):
                 "sort": "relevance",
                 "return_type": "news",
                 "use_neural_search": "false",
-                "return_story_text": "true",
-                "return_story_summary": "false"
+                "return_story_text": "true"
             }
             try:
                 resp = requests.get(
@@ -283,7 +297,6 @@ class FinalTournamentBot2025(ForecastBot):
                     timeout=15
                 )
                 resp.raise_for_status()
-                # API always returns {"data": {"news": [...]}} or {"news": [...]} depending on version
                 json_resp = resp.json()
                 data = json_resp.get("data", json_resp)
                 return data.get("news", [])
@@ -314,11 +327,13 @@ class FinalTournamentBot2025(ForecastBot):
         pred: BinaryPrediction = await structure_output(
             reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
         )
-        # Type safety for missing values
-        val = pred.prediction_in_decimal
-        if val is None:
+        # Force float conversion
+        try:
+            val = float(pred.prediction_in_decimal)
+        except (ValueError, TypeError):
             val = 0.5
-        decimal_pred = max(0.01, min(0.99, float(val)))
+            
+        decimal_pred = max(0.01, min(0.99, val))
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
 
     async def _run_forecast_on_multiple_choice(
@@ -381,12 +396,31 @@ class FinalTournamentBot2025(ForecastBot):
         percentile_list: list[Percentile] = await structure_output(
             reasoning, list[Percentile], model=self.get_llm("parser", "llm")
         )
-        dist = NumericDistribution.from_question(percentile_list, question)
+        
+        # ✅ FIX 2: Sanitize types before creating distribution
+        # The error "< not supported between str and int" happens if p.value is a string
+        clean_percentiles = []
+        for p in percentile_list:
+            try:
+                # Strip commas or % signs just in case
+                v_str = str(p.value).replace(',', '').replace('%', '').strip()
+                val = float(v_str)
+                clean_percentiles.append(Percentile(value=val, percentile=p.percentile))
+            except (ValueError, TypeError):
+                continue
+                
+        if not clean_percentiles:
+            # Fallback to defaults if parsing totally failed
+            mid = (question.lower_bound + question.upper_bound) / 2 if (question.lower_bound is not None and question.upper_bound is not None) else 0.0
+            clean_percentiles = [Percentile(value=mid, percentile=0.5)]
+
+        dist = NumericDistribution.from_question(clean_percentiles, question)
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion
     ) -> tuple[str, str]:
+        # Ensure bounds are treated as strings for display, but safe logic elsewhere
         low = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
         high = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
         low_msg = f"The outcome cannot be lower than {low}." if not question.open_lower_bound else f"The question creator thinks it's unlikely to be below {low}."
@@ -394,7 +428,7 @@ class FinalTournamentBot2025(ForecastBot):
         return low_msg, high_msg
 
     # -----------------------------
-    # FIXED: Type-safe aggregation
+    # Type-safe aggregation
     # -----------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
         predictions = []
@@ -415,6 +449,7 @@ class FinalTournamentBot2025(ForecastBot):
                 predictions.append(pred.prediction_value)
                 reasonings.append(pred.reasoning)
             except Exception as e:
+                # Log traceback for debugging if needed
                 logger.error(f"Individual forecaster failed: {e}")
                 continue
 
@@ -428,7 +463,6 @@ class FinalTournamentBot2025(ForecastBot):
             # Safe filtering
             numeric_preds = [p for p in predictions if isinstance(p, (int, float)) and not isinstance(p, bool)]
             if not numeric_preds:
-                # Fallback if structure_output failed consistently
                 numeric_preds = [0.5]
             median_val = median(numeric_preds)
             final_pred = ReasonedPrediction(prediction_value=median_val, reasoning=" | ".join(reasonings))
@@ -477,35 +511,38 @@ class FinalTournamentBot2025(ForecastBot):
                     if isinstance(p, NumericDistribution):
                         for item in p.declared_percentiles:
                             # Robust check: item.value might be string or float
-                            # item.percentile might be 0.1 or 10
                             try:
-                                val = float(item.value)
+                                val = float(str(item.value).replace(',',''))
                             except (ValueError, TypeError):
                                 continue
 
                             # Normalize percentile check (handle 0.1 vs 10.0 mismatch)
-                            p_val = float(item.percentile)
-                            is_match = abs(p_val - pt) < 0.01 or abs(p_val - (pt * 100)) < 1.0
-                            
-                            if is_match:
-                                vals.append(val)
+                            try:
+                                p_val = float(item.percentile)
+                                is_match = abs(p_val - pt) < 0.01 or abs(p_val - (pt * 100)) < 1.0
+                                if is_match:
+                                    vals.append(val)
+                            except:
+                                continue
                 
-                # If aggregation fails, try to use midpoint of bounds as fallback, else 50.0
+                # If aggregation fails, try to use midpoint of bounds as fallback
                 if vals:
                     median_val = median(vals)
                 else:
                     # Try to find a reasonable center
-                    lower = question.nominal_lower_bound or question.lower_bound or 0.0
-                    upper = question.nominal_upper_bound or question.upper_bound or 100.0
-                    median_val = (lower + upper) / 2.0
-                
+                    l = question.lower_bound or 0.0
+                    u = question.upper_bound or 100.0
+                    try:
+                        median_val = (float(l) + float(u)) / 2.0
+                    except:
+                        median_val = 0.0
+
                 median_percentiles.append(Percentile(percentile=pt, value=median_val))
             
             final_dist = NumericDistribution.from_question(median_percentiles, question)
             final_pred = ReasonedPrediction(prediction_value=final_dist, reasoning=" | ".join(reasonings))
 
         else:
-            # Fallback for unexpected types
             final_pred = ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
 
         return final_pred
@@ -515,7 +552,6 @@ class FinalTournamentBot2025(ForecastBot):
 # MAIN
 # -----------------------------
 if __name__ == "__main__":
-    # Fix: Ensure logger name is correct for litellm suppression
     litellm_logger = logging.getLogger("litellm")
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
@@ -540,21 +576,17 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
     )
 
-    all_reports = []
-    # Using asyncio.run inside loop is okay for scripts, but ideally one loop.
-    # We will use one loop for all tournaments to be safe.
     async def run_all():
-        reports = []
+        all_reports = []
         for tid in args.tournament_ids:
             logger.info(f"▶️ Forecasting on tournament: {tid}")
-            # Ensure return_exceptions is True so one crash doesn't kill the bot
-            t_reports = await bot.forecast_on_tournament(tid, return_exceptions=True)
-            reports.extend(t_reports)
-        return reports
+            reports = await bot.forecast_on_tournament(tid, return_exceptions=True)
+            all_reports.extend(reports)
+        return all_reports
 
     try:
-        all_reports = asyncio.run(run_all())
-        bot.log_report_summary(all_reports)
+        reports = asyncio.run(run_all())
+        bot.log_report_summary(reports)
         logger.info("✅ FinalTournamentBot2025 run completed.")
     except Exception as e:
         logger.error(f"❌ Fatal error during execution: {e}")
