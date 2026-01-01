@@ -1,297 +1,473 @@
+import argparse
+import asyncio
+import logging
 import os
-import json
-import requests
+import textwrap
 import re
-import time
-import statistics
-from openai import OpenAI
-from tavily import TavilyClient
-from dotenv import load_dotenv
+from datetime import datetime
+from typing import List, Literal, Optional, Union
 
-# Load environment variables
-load_dotenv()
+# AskNews integration (preferred official SDK; fallback to requests if unavailable)
+try:
+    from asknews_sdk import AskNewsSDK
+    ASKNEWS_SDK_AVAILABLE = True
+except ImportError:
+    ASKNEWS_SDK_AVAILABLE = False
+    import requests
 
-# --- CONFIGURATION ---
-METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-
-# 🎯 TARGETS LIST
-# Strings = Tournament Slugs (e.g., "ACX2026")
-# Integers = Specific Question IDs OR Project IDs (Script now detects which is which)
-TARGETS = [
-    "ACX2026",
-    "market-pulse-26q1",
-    32916  # This is a Project ID (Spring AIB 2026), script will now handle it correctly.
-]
-
-# ⚡ THE COUNCIL
-FREE_MODELS = [
-    "deepseek/deepseek-r1:free",
-    "google/gemini-2.0-flash-exp:free",
-    "meta-llama/llama-3.2-11b-vision-instruct:free",
-    "tngtech/deepseek-r1t2-chimera:free",
-]
-
-if not all([METACULUS_TOKEN, OPENROUTER_API_KEY, TAVILY_API_KEY]):
-    raise ValueError("❌ Missing API Keys!")
-
-tavily = TavilyClient(api_key=TAVILY_API_KEY)
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    default_headers={"HTTP-Referer": "https://github.com/bot", "X-Title": "Geobot Forecaster"}
+# Forecasting tools
+from forecasting_tools import (
+    BinaryQuestion,
+    ForecastBot,
+    GeneralLlm,
+    MetaculusApi,
+    MetaculusQuestion,
+    MultipleChoiceQuestion,
+    NumericDistribution,
+    NumericQuestion,
+    Percentile,
+    BinaryPrediction,
+    PredictedOptionList,
+    PredictedOption,
+    ReasonedPrediction,
+    clean_indents,
+    structure_output,
 )
 
-# --- UTILS ---
-def repair_json(text):
-    """Attempts to extract and parse JSON even if it's messy."""
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    
-    # Extract strictly between first { and last }
-    start = text.find('{')
-    end = text.rfind('}')
-    
-    if start == -1 or end == -1:
-        return None
-        
-    json_str = text[start:end+1]
-    
-    try:
-        return json.loads(json_str)
-    except:
-        # Naive cleanup for common trailing comma errors
-        try:
-            json_str = re.sub(r',\s*}', '}', json_str)
-            return json.loads(json_str)
-        except:
-            return None
-
-def get_headers():
-    return {"Authorization": f"Token {METACULUS_TOKEN}"}
-
-# --- 🚀 ROBUST FETCHING LOGIC ---
-def fetch_questions_for_target(target):
-    base_url = "https://www.metaculus.com/api2"
-    
-    # A. If Target is an Integer (Could be Question ID OR Project ID)
-    if isinstance(target, int):
-        print(f"🔍 Checking if {target} is a Question ID...")
-        try:
-            # 1. Try as Question
-            resp = requests.get(f"{base_url}/questions/{target}/", headers=get_headers())
-            if resp.status_code == 200:
-                q = resp.json()
-                if q['status'] == 'open':
-                    return [q]
-                else:
-                    print(f"   ⚠️ Question {target} is closed.")
-                    return []
-            elif resp.status_code == 404:
-                print(f"   ⚠️ {target} is not a Question ID. Checking Project ID...")
-                # 2. Fallback: Treat as Project ID (e.g. 32916)
-                return _fetch_from_tournament_or_project(target)
-                
-        except Exception as e:
-            print(f"   ❌ Error checking ID {target}: {e}")
-            return []
-
-    # B. If Target is a String (Tournament Slug)
-    return _fetch_from_tournament_or_project(target)
-
-def _fetch_from_tournament_or_project(target_identifier):
-    """Resolves a slug or ID to a list of questions."""
-    base_url = "https://www.metaculus.com/api2"
-    print(f"🔍 Resolving Container: '{target_identifier}'...")
-    
-    tournament_id = None
-    
-    # 1. If it's already an INT, it's the ID.
-    if isinstance(target_identifier, int):
-        tournament_id = target_identifier
-        print(f"   ✅ Using ID: {tournament_id}")
+# -----------------------------
+# Helper: Type-safe median (skip non-floats)
+# -----------------------------
+def median(lst: List[Union[float, int]]) -> float:
+    # ✅ Filter out non-numeric (e.g., fallback strings)
+    numeric_vals = [x for x in lst if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    if not numeric_vals:
+        raise ValueError("median() arg contains no numeric values")
+    sorted_vals = sorted(numeric_vals)
+    n = len(sorted_vals)
+    mid = n // 2
+    if n % 2 == 0:
+        return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2.0
     else:
-        # 2. Resolve Slug -> ID
-        try:
-            # Try as Tournament
-            resp = requests.get(f"{base_url}/tournaments/{target_identifier}/", headers=get_headers())
-            if resp.status_code == 200:
-                tournament_id = resp.json()['id']
-                print(f"   ✅ Found Tournament ID: {tournament_id}")
-            else:
-                # Try as Project
-                resp = requests.get(f"{base_url}/projects/{target_identifier}/", headers=get_headers())
-                if resp.status_code == 200:
-                    tournament_id = resp.json()['id']
-                    print(f"   ✅ Found Project ID: {tournament_id}")
-        except Exception as e:
-            print(f"   ❌ Resolution failed: {e}")
-            return []
+        return float(sorted_vals[mid])
 
-    if not tournament_id:
-        print(f"   ❌ Could not resolve '{target_identifier}'. Skipping.")
-        return []
 
-    # 3. Fetch Questions
-    # Try 'tournament' param first, then 'project'
-    params = {"status": "open", "type": "forecast", "limit": 10, "tournament": tournament_id}
-    questions = _execute_list_query(params)
-    
-    if not questions:
-        # Switch to project param
-        del params['tournament']
-        params['project'] = tournament_id
-        questions = _execute_list_query(params)
-        
-    return questions
+# -----------------------------
+# ASKNEWS QUERY BUILDER (≤ 397 chars — robust)
+# -----------------------------
+def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
+    q = question.question_text.strip()
+    bg = (question.background_info or "").strip()
 
-def _execute_list_query(params):
-    time.sleep(1)
-    try:
-        resp = requests.get("https://www.metaculus.com/api2/questions/", params=params, headers=get_headers())
-        if resp.status_code == 200:
-            return resp.json()['results']
-        return []
-    except:
-        return []
+    q = re.sub(r"http\S+", "", q)
+    bg = re.sub(r"http\S+", "", bg)
+    q = re.sub(r"\s+", " ", q).strip()
+    bg = re.sub(r"\s+", " ", bg).strip()
 
-# --- 🧠 PROMPT FACTORY ---
-def generate_prompt(q_data, evidence):
-    title = q_data['title']
-    background = q_data.get('description', '')[:1500]
-    
-    persona = "You are a Superforecaster. Analyze Evidence. Think in Base Rates. Return JSON ONLY."
-    
-    if q_data['type'] == 'forecast':
-        return f"""
-        {persona}
-        QUESTION: {title}
-        BACKGROUND: {background}
-        NEWS: {evidence}
-        TASK: JSON with probability (0-100) and concise rationale.
-        OUTPUT: {{ "prediction": 65, "comment": "Base rate is..." }}
-        """
-    elif q_data['type'] in ['date', 'numeric']:
-        return f"""
-        {persona}
-        QUESTION: {title}
-        BACKGROUND: {background}
-        NEWS: {evidence}
-        TASK: JSON with p25, p50, p75.
-        OUTPUT: {{ "prediction": {{ "p25": 10, "p50": 50, "p75": 90 }}, "comment": "Range based on..." }}
-        """
-    elif q_data['type'] == 'multiple_choice':
-        options = q_data.get('possibilities', {}).get('format', {}).get('options', [])
-        labels = [o if isinstance(o, str) else o.get('label') for o in options]
-        return f"""
-        {persona}
-        QUESTION: {title}
-        OPTIONS: {labels}
-        NEWS: {evidence}
-        TASK: JSON assigning % to options (Sum 100).
-        OUTPUT: {{ "prediction": {{ "{labels[0]}": 20, "{labels[1] if len(labels)>1 else 'B'}": 80 }}, "comment": "Rationale..." }}
-        """
-    return None
+    if len(q) <= max_chars:
+        if not bg:
+            return q
+        candidate = f"{q} — {bg}"
+        if len(candidate) <= max_chars:
+            return candidate
+        space_for_bg = max_chars - len(q) - 3
+        if space_for_bg > 10:
+            bg_part = textwrap.shorten(bg, width=space_for_bg, placeholder="…")
+            return f"{q} — {bg_part}"
+        else:
+            return q
 
-# --- AGGREGATION ---
-def aggregate_council_results(results, q_type):
-    if not results: return None
-    
-    preds = [r['prediction'] for r in results]
-    comments = [r['comment'] for r in results]
-    best_comment = max(comments, key=len) if comments else "No comment."
-    
-    final_pred = None
-    
-    if q_type == 'forecast':
-        valid = [p for p in preds if isinstance(p, (int, float))]
-        if valid: final_pred = statistics.median(valid)
+    first_sent = q.split('.')[0].strip()
+    if len(first_sent) > max_chars:
+        return textwrap.shorten(first_sent, width=max_chars, placeholder="…")
 
-    elif q_type in ['date', 'numeric']:
-        p25s, p50s, p75s = [], [], []
-        for p in preds:
-            if isinstance(p, dict):
-                p25s.append(p.get('p25', 0))
-                p50s.append(p.get('p50', 0))
-                p75s.append(p.get('p75', 0))
-        if p50s:
-            final_pred = {
-                "p25": statistics.mean(p25s),
-                "p50": statistics.mean(p50s),
-                "p75": statistics.mean(p75s)
-            }
+    remaining = max_chars - len(first_sent) - 3
+    if remaining > 10 and bg:
+        bg_part = textwrap.shorten(bg, width=remaining, placeholder="…")
+        combo = f"{first_sent} — {bg_part}"
+        if len(combo) <= max_chars:
+            return combo
 
-    elif q_type == 'multiple_choice':
-        agg = {}
-        count = 0
-        for p in preds:
-            if isinstance(p, dict):
-                count += 1
-                for k, v in p.items():
-                    agg[k] = agg.get(k, 0) + float(v)
-        if count > 0:
-            final_pred = {k: v/count for k, v in agg.items()}
+    return textwrap.shorten(q, width=max_chars, placeholder="…")
 
-    if not final_pred: return None
-    return {"prediction": final_pred, "comment": best_comment}
 
-# --- MAIN ---
-def run_council(q_data):
-    try:
-        search = tavily.search(query=q_data['title'], max_results=3)
-        evidence = "\n".join([f"- {r['content']}" for r in search['results']])
-    except:
-        evidence = "No recent news found."
+# -----------------------------
+# Logging & AskNews Setup
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("FinalTournamentBot2025")
 
-    prompt = generate_prompt(q_data, evidence)
-    if not prompt: return None
+ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
+ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET")
 
-    print(f"   🗳️  Polling Council ({len(FREE_MODELS)} models)...")
-    results = []
-    
-    for model in FREE_MODELS:
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3, max_tokens=800
+if not (ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET):
+    raise EnvironmentError("ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET must be set.")
+
+
+class FinalTournamentBot2025(ForecastBot):
+    _max_concurrent_questions = 1
+    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
+
+    def _llm_config_defaults(self) -> dict[str, str]:
+        defaults = super()._llm_config_defaults()
+        defaults.update({
+            "researcher": "openrouter/openai/gpt-5",
+            "default": "openrouter/openai/gpt-5",
+            "parser": "openrouter/openai/gpt-4o-mini",
+            "proponent": "openrouter/anthropic/claude-4.5-sonnet",
+            "opponent": "openrouter/openai/gpt-5",
+            "analyst_low": "openrouter/openai/gpt-4o-mini",
+            "analyst_high": "openrouter/openai/gpt-5",
+            "analyst_geopolitical": "openrouter/anthropic/claude-4.5-sonnet",
+            "analyst_tech": "openrouter/openai/gpt-5",
+            "analyst_climate": "openrouter/openai/gpt-4o-mini",
+            "analyst_mc": "openrouter/openai/gpt-5",
+            "synthesizer_1": "openrouter/openai/gpt-5",
+            "synthesizer_2": "openrouter/anthropic/claude-4.5-sonnet",
+            "synthesizer_3": "openrouter/openai/gpt-4o",
+        })
+        return defaults
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._asknews_client = None
+        logger.info("Intialized FinalTournamentBot2025 (AskNews-powered)")
+        if ASKNEWS_SDK_AVAILABLE:
+            import asknews_sdk
+            logger.info(f"AskNews SDK version: {asknews_sdk.__version__}")
+
+    def _get_asknews_client(self):
+        if self._asknews_client is not None:
+            return self._asknews_client
+
+        if ASKNEWS_SDK_AVAILABLE:
+            # ✅ ONLY pass supported args — works on ALL SDK versions
+            self._asknews_client = AskNewsSDK(
+                client_id=ASKNEWS_CLIENT_ID,
+                client_secret=ASKNEWS_CLIENT_SECRET
+                # NO enable_openai/etc — they break older SDKs
             )
-            data = repair_json(resp.choices[0].message.content)
-            if data and 'prediction' in data: results.append(data)
-        except: pass
-            
-    return aggregate_council_results(results, q_data['type'])
+        else:
+            auth_url = "https://api.asknews.app/v1/oauth/token"
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": ASKNEWS_CLIENT_ID,
+                "client_secret": ASKNEWS_CLIENT_SECRET
+            }
+            resp = requests.post(auth_url, data=data)
+            resp.raise_for_status()
+            token = resp.json()["access_token"]
+            self._asknews_client = {"token": token}
+        return self._asknews_client
 
-def submit(q, result):
-    print(f"      🚀 [WOULD SUBMIT]: {result['prediction']}")
-    print(f"      💬 [WOULD COMMENT]: {result['comment'][:100]}...")
-    # Uncomment to enable real submission
-    # try:
-    #     pid = q['id']
-    #     val = result['prediction']
-    #     if q['type'] == 'forecast': val = float(val)/100.0
-    #     elif q['type'] == 'multiple_choice': val = [val.get(o['label'], 0) for o in q['possibilities']['format']['options']]
-    #     requests.post(f"https://www.metaculus.com/api2/questions/{pid}/predict/", json={"prediction": val}, headers=get_headers())
-    # except Exception as e: print(e)
+    async def run_research(self, question: MetaculusQuestion) -> str:
+        async with self._concurrency_limiter:
+            today_str = datetime.now().strftime("%Y-%m-%d")
 
-def main():
-    for target in TARGETS:
-        print(f"\n🌍 Processing: {target}")
-        questions = fetch_questions_for_target(target)
-        
-        if not questions:
-            print("   ⚠️ No questions found.")
-            continue
-            
-        print(f"   ✅ Found {len(questions)} questions.")
-        for q in questions:
-            print(f"\n   🔮 {q['title'][:50]}...")
-            res = run_council(q)
-            if res:
-                submit(q, res)
-            else:
-                print("      ❌ Council Consensus Failed.")
-            time.sleep(2)
+            query = build_asknews_query(question)
+            logger.debug(f"AskNews query ({len(query)} chars): {repr(query)}")
 
+            asknews_summary = "[AskNews research pending]"
+
+            try:
+                loop = asyncio.get_event_loop()
+                stories = await loop.run_in_executor(
+                    None,
+                    self._sync_asknews_search,
+                    query
+                )
+
+                if not stories:
+                    asknews_summary = "[AskNews: No recent stories found]"
+                else:
+                    snippets = []
+                    for i, story in enumerate(stories[:5]):
+                        if ASKNEWS_SDK_AVAILABLE:
+                            title = getattr(story, "title", "Untitled")
+                            text = getattr(story, "text", "")[:200]
+                        else:
+                            title = story.get("title", "Untitled")
+                            text = (story.get("text") or "")[:200]
+                        snippet = f"[{i+1}] {title}: {textwrap.shorten(text, width=180, placeholder='…')}"
+                        snippets.append(snippet)
+                    asknews_summary = "\n".join(snippets)
+                    logger.info(f"AskNews succeeded with {len(stories)} stories")
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"AskNews research failed: {error_msg}")
+                asknews_summary = f"[AskNews error: {error_msg}]"
+
+            # LLM research (no change)
+            researcher_llm = self.get_llm("researcher", "llm")
+            prompt = clean_indents(f"""
+                You are an assistant to a superforecaster.
+                Question: {question.question_text}
+                Resolution Criteria: {question.resolution_criteria}
+                Fine Print: {question.fine_print}
+                Provide a concise, factual summary with recent data.
+            """)
+            try:
+                llm_research = await researcher_llm.invoke(prompt)
+            except Exception as e:
+                llm_research = f"[LLM research failed: {str(e)}]"
+
+            return (
+                f"--- ASKNEWS LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
+                f"--- LLM RESEARCH SUMMARY ---\n{llm_research}"
+            )
+
+    def _sync_asknews_search(self, query: str):
+        """✅ Works on all AskNews SDK versions"""
+        client = self._get_asknews_client()
+
+        if ASKNEWS_SDK_AVAILABLE:
+            response = client.news.search_stories(
+                query=query,
+                n_articles=5,
+                return_type="news",
+                use_neural_search=False,
+                return_story_text=True,
+                return_story_summary=False,
+            )
+            # Unified extraction (handles old/new response shapes)
+            data = getattr(response, "data", response if isinstance(response, dict) else {})
+            return data.get("news", []) if isinstance(data, dict) else []
+
+        else:
+            headers = {"Authorization": f"Bearer {client['token']}"}
+            params = {
+                "q": query,
+                "n_articles": 5,
+                "sort": "relevance",
+                "return_type": "news",
+                "use_neural_search": "false",
+                "return_story_text": "true",
+                "return_story_summary": "false"
+            }
+            resp = requests.get(
+                "https://api.asknews.app/v1/news",
+                headers=headers,
+                params=params,
+                timeout=15
+            )
+            resp.raise_for_status()
+            return resp.json().get("data", {}).get("news", [])
+
+    # --- Forecasting methods (no change) ---
+
+    async def _run_forecast_on_binary(
+        self, question: BinaryQuestion, research: str
+    ) -> ReasonedPrediction[float]:
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Research: {research}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            (a) Time until resolution
+            (b) Status quo outcome
+            (c) Scenario for No
+            (d) Scenario for Yes
+            Final output: "Probability: ZZ%"
+        """)
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        pred: BinaryPrediction = await structure_output(
+            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
+        )
+        decimal_pred = max(0.01, min(0.99, pred.prediction_in_decimal))
+        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+
+    async def _run_forecast_on_multiple_choice(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
+            Question: {question.question_text}
+            Options: {question.options}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Research: {research}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            (a) Time until resolution
+            (b) Status quo outcome
+            (c) Unexpected scenario
+            Final output:
+            {chr(10).join([f"{opt}: XX%" for opt in question.options])}
+        """)
+        parsing_instructions = f"Valid options: {question.options}"
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        pred: PredictedOptionList = await structure_output(
+            reasoning, PredictedOptionList, self.get_llm("parser", "llm"), parsing_instructions
+        )
+        return ReasonedPrediction(prediction_value=pred, reasoning=reasoning)
+
+    async def _run_forecast_on_numeric(
+        self, question: NumericQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        low_msg, high_msg = self._create_upper_and_lower_bound_messages(question)
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Units: {question.unit_of_measure or 'inferred'}
+            Research: {research}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+            {low_msg}
+            {high_msg}
+            (a) Time until resolution
+            (b) Outcome if nothing changed
+            (c) Outcome if trend continues
+            (d) Expert/market expectations
+            (e) Low-outcome scenario
+            (f) High-outcome scenario
+            Final output:
+            Percentile 10: X
+            Percentile 20: X
+            Percentile 40: X
+            Percentile 60: X
+            Percentile 80: X
+            Percentile 90: X
+        """)
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        percentile_list: list[Percentile] = await structure_output(
+            reasoning, list[Percentile], model=self.get_llm("parser", "llm")
+        )
+        dist = NumericDistribution.from_question(percentile_list, question)
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
+
+    def _create_upper_and_lower_bound_messages(
+        self, question: NumericQuestion
+    ) -> tuple[str, str]:
+        low = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
+        high = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
+        low_msg = f"The outcome cannot be lower than {low}." if not question.open_lower_bound else f"The question creator thinks it's unlikely to be below {low}."
+        high_msg = f"The outcome cannot be higher than {high}." if not question.open_upper_bound else f"The question creator thinks it's unlikely to be above {high}."
+        return low_msg, high_msg
+
+    # -----------------------------
+    # Fix: Add type-checking in aggregation to prevent '<' str/int error
+    # -----------------------------
+    async def _make_prediction(self, question: MetaculusQuestion, research: str):
+        predictions = []
+        reasonings = []
+
+        for _ in range(5):
+            try:
+                if isinstance(question, BinaryQuestion):
+                    pred = await self._run_forecast_on_binary(question, research)
+                elif isinstance(question, MultipleChoiceQuestion):
+                    pred = await self._run_forecast_on_multiple_choice(question, research)
+                elif isinstance(question, NumericQuestion):
+                    pred = await self._run_forecast_on_numeric(question, research)
+                else:
+                    raise ValueError(f"Unsupported question type: {type(question)}")
+                predictions.append(pred.prediction_value)
+                reasonings.append(pred.reasoning)
+            except Exception as e:
+                logger.error(f"Forecaster failed: {e}")
+                continue
+
+        if not predictions:
+            raise RuntimeError("All 5 forecasters failed.")
+
+        # ✅ Median aggregation with type safety
+        if isinstance(question, BinaryQuestion):
+            # Filter out non-float predictions (e.g., fallback strings)
+            numeric_preds = [p for p in predictions if isinstance(p, (int, float)) and not isinstance(p, bool)]
+            if not numeric_preds:
+                raise RuntimeError("No valid numeric predictions from forecasters.")
+            median_val = median(numeric_preds)
+            final_pred = ReasonedPrediction(prediction_value=median_val, reasoning=" | ".join(reasonings))
+
+        elif isinstance(question, MultipleChoiceQuestion):
+            options = question.options
+            avg_probs = {}
+            for opt in options:
+                option_probs = []
+                for p in predictions:
+                    if isinstance(p, PredictedOptionList):
+                        pred_dict = {po.option_name: po.probability for po in p.predicted_options}
+                        prob = pred_dict.get(opt, 0.0)
+                        if isinstance(prob, (int, float)) and not isinstance(prob, bool):
+                            option_probs.append(float(prob))
+                if option_probs:
+                    avg_probs[opt] = median(option_probs)
+                else:
+                    avg_probs[opt] = 0.0
+            total = sum(avg_probs.values())
+            if total > 0:
+                avg_probs = {k: v / total for k, v in avg_probs.items()}
+            predicted_options_list = [
+                PredictedOption(option_name=opt, probability=prob)
+                for opt, prob in avg_probs.items()
+            ]
+            final_pred = ReasonedPrediction(
+                prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
+                reasoning=" | ".join(reasonings)
+            )
+
+        elif isinstance(question, NumericQuestion):
+            target_pts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+            median_percentiles = []
+            for pt in target_pts:
+                vals = []
+                for p in predictions:
+                    if isinstance(p, NumericDistribution):
+                        for item in p.declared_percentiles:
+                            if isinstance(item.value, (int, float)) and abs(item.percentile - pt) < 0.01:
+                                vals.append(float(item.value))
+                median_val = median(vals) if vals else 50.0  # safe fallback
+                median_percentiles.append(Percentile(percentile=pt, value=median_val))
+            final_dist = NumericDistribution.from_question(median_percentiles, question)
+            final_pred = ReasonedPrediction(prediction_value=final_dist, reasoning=" | ".join(reasonings))
+
+        else:
+            final_pred = ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
+
+        return final_pred
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
 if __name__ == "__main__":
-    main()
+    litellm_logger = logging.getLogger("LiteLLM")
+    litellm_logger.setLevel(logging.WARNING)
+    litellm_logger.propagate = False
+
+    parser = argparse.ArgumentParser(description="Run FinalTournamentBot2025 (AskNews + GPT-5/Claude-4.5)")
+    parser.add_argument(
+        "--tournament-ids",
+        nargs="+",
+        type=str,
+        default=["ACX2026", "32916", "market-pulse-26q1", "minibench"],  # ✅ minibench added
+    )
+    args = parser.parse_args()
+
+    if not os.getenv("OPENROUTER_API_KEY"):
+        logger.error("❌ OPENROUTER_API_KEY is required")
+        exit(1)
+
+    bot = FinalTournamentBot2025(
+        research_reports_per_question=1,
+        predictions_per_research_report=5,
+        publish_reports_to_metaculus=True,
+        skip_previously_forecasted_questions=True,
+    )
+
+    all_reports = []
+    for tid in args.tournament_ids:
+        logger.info(f"▶️ Forecasting on tournament: {tid}")
+        reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
+        all_reports.extend(reports)
+
+    bot.log_report_summary(all_reports)
+    logger.info("✅ FinalTournamentBot2025 (AskNews-powered) run completed.")
