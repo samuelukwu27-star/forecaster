@@ -699,5 +699,4 @@ if __name__ == "__main__":
         logger.info("✅ FinalTournamentBot2025 run completed.")
     except Exception as e:
         logger.error(f"❌ Fatal error during execution: {e}")
-        raise SystemExit(1)
-```0
+        raise SystemExit(1))
