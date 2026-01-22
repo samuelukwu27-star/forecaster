@@ -6,7 +6,7 @@ import textwrap
 import re
 import math
 from datetime import datetime
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Union, Dict, Any
 
 # AskNews integration (preferred official SDK; fallback to requests if unavailable)
 try:
@@ -34,24 +34,24 @@ from forecasting_tools import (
 )
 
 # -----------------------------
-# Helper: Type-safe median
+# Helpers: robust stats
 # -----------------------------
+def _is_num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
 def median(lst: List[Union[float, int]]) -> float:
-    numeric_vals = [x for x in lst if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    numeric_vals = [x for x in lst if _is_num(x)]
     if not numeric_vals:
         raise ValueError("median() arg contains no numeric values")
-
-    sorted_vals = sorted(numeric_vals)
+    sorted_vals = sorted(float(x) for x in numeric_vals)
     n = len(sorted_vals)
     mid = n // 2
     if n % 2 == 0:
         return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2.0
     return float(sorted_vals[mid])
 
-
 def mean(xs: List[float]) -> float:
     return sum(xs) / len(xs)
-
 
 def stdev(xs: List[float]) -> float:
     if len(xs) <= 1:
@@ -59,9 +59,7 @@ def stdev(xs: List[float]) -> float:
     m = mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
-
 def ci90(xs: List[float]) -> tuple[float, float]:
-    # Simple normal-approx CI as an uncertainty proxy for ensemble agreement
     m = mean(xs)
     s = stdev(xs)
     se = s / math.sqrt(len(xs)) if xs else 0.0
@@ -70,15 +68,31 @@ def ci90(xs: List[float]) -> tuple[float, float]:
     hi = min(1.0, m + z * se)
     return lo, hi
 
-
 def entropy(probs: Dict[str, float]) -> float:
-    # Natural log entropy; lower => sharper distribution
     e = 0.0
     for p in probs.values():
         if p > 0:
             e -= p * math.log(p)
     return e
 
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(x).replace(",", "").replace("%", "").strip())
+    except Exception:
+        return default
+
+def normalize_percentile(p: Any) -> float:
+    """
+    Accepts 0.1, 10, "10", "10%", "0.1" and returns value in [0,1].
+    """
+    perc = safe_float(p, default=0.5)
+    if perc > 1.0:
+        perc = perc / 100.0
+    if perc < 0.0:
+        perc = 0.0
+    if perc > 1.0:
+        perc = 1.0
+    return perc
 
 # -----------------------------
 # ASKNEWS QUERY BUILDER
@@ -87,7 +101,6 @@ def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> st
     q = (question.question_text or "").strip()
     bg = (question.background_info or "").strip()
 
-    # Remove URLs and extra whitespace
     q = re.sub(r"http\S+", "", q)
     bg = re.sub(r"http\S+", "", bg)
     q = re.sub(r"\s+", " ", q).strip()
@@ -99,15 +112,12 @@ def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> st
         candidate = f"{q} — {bg}"
         if len(candidate) <= max_chars:
             return candidate
-
-        # Try to fit a shortened background
         space_for_bg = max_chars - len(q) - 3
         if space_for_bg > 10:
             bg_part = textwrap.shorten(bg, width=space_for_bg, placeholder="…")
             return f"{q} — {bg_part}"
         return q
 
-    # If question itself is too long, take the first sentence
     first_sent = q.split(".")[0].strip()
     if len(first_sent) > max_chars:
         return textwrap.shorten(first_sent, width=max_chars, placeholder="…")
@@ -121,7 +131,6 @@ def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> st
 
     return textwrap.shorten(q, width=max_chars, placeholder="…")
 
-
 # -----------------------------
 # Logging & AskNews Setup
 # -----------------------------
@@ -133,11 +142,9 @@ logger = logging.getLogger("FinalTournamentBot2025")
 
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET")
-
 ASKNEWS_ENABLED = bool(ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET)
 if not ASKNEWS_ENABLED:
     logger.warning("ASKNEWS_CLIENT_ID/ASKNEWS_CLIENT_SECRET not set — continuing in LLM-only research mode.")
-
 
 class FinalTournamentBot2025(ForecastBot):
     _max_concurrent_questions = 1
@@ -150,11 +157,9 @@ class FinalTournamentBot2025(ForecastBot):
             # Research
             "researcher_gpt": "openrouter/openai/gpt-5.2",
             "researcher_claude": "openrouter/anthropic/claude-sonnet-4.5",
-
             # Forecasting
             "forecaster_gpt": "openrouter/openai/gpt-5.2",
             "forecaster_claude": "openrouter/anthropic/claude-sonnet-4.5",
-
             # Parsing
             "parser": "openrouter/anthropic/claude-sonnet-4.5",
         })
@@ -172,9 +177,12 @@ class FinalTournamentBot2025(ForecastBot):
             except Exception:
                 pass
 
-        # 5-run schedule for diversity using ONLY the 2 models
+        # 5-run schedule: only the two models
         self._run_schedule = ["gpt", "claude", "gpt", "claude", "gpt"]
 
+    # -----------------------------
+    # AskNews
+    # -----------------------------
     def _get_asknews_client(self):
         if self._asknews_client is not None:
             return self._asknews_client
@@ -209,22 +217,16 @@ class FinalTournamentBot2025(ForecastBot):
         return self._asknews_client
 
     def _get_research_llm(self, model_tag: str):
-        if model_tag == "claude":
-            return self.get_llm("researcher_claude", "llm")
-        return self.get_llm("researcher_gpt", "llm")
+        return self.get_llm("researcher_claude", "llm") if model_tag == "claude" else self.get_llm("researcher_gpt", "llm")
 
     def _get_forecaster_llm(self, model_tag: str):
-        if model_tag == "claude":
-            return self.get_llm("forecaster_claude", "llm")
-        return self.get_llm("forecaster_gpt", "llm")
+        return self.get_llm("forecaster_claude", "llm") if model_tag == "claude" else self.get_llm("forecaster_gpt", "llm")
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             today_str = datetime.now().strftime("%Y-%m-%d")
             query = build_asknews_query(question)
-            logger.debug(f"AskNews query ({len(query)} chars): {repr(query)}")
 
-            # AskNews research
             asknews_summary = "[AskNews disabled]"
             try:
                 if ASKNEWS_ENABLED:
@@ -237,21 +239,18 @@ class FinalTournamentBot2025(ForecastBot):
                         for i, story in enumerate(stories[:5]):
                             if isinstance(story, dict):
                                 title = story.get("title", "Untitled")
-                                text = (story.get("text") or "")[:400]
+                                text = (story.get("text") or "")[:500]
                             else:
                                 title = getattr(story, "title", "Untitled")
-                                text = (getattr(story, "text", "") or "")[:400]
-
-                            snippet = f"[{i+1}] {title}: {textwrap.shorten(text, width=220, placeholder='…')}"
+                                text = (getattr(story, "text", "") or "")[:500]
+                            snippet = f"[{i+1}] {title}: {textwrap.shorten(text, width=240, placeholder='…')}"
                             snippets.append(snippet)
                         asknews_summary = "\n".join(snippets)
                         logger.info(f"AskNews succeeded with {len(stories)} stories")
             except Exception as e:
-                error_msg = str(e)
-                logger.error(f"AskNews research failed: {error_msg}")
-                asknews_summary = f"[AskNews error: {error_msg}]"
+                asknews_summary = f"[AskNews error: {str(e)}]"
+                logger.error(f"AskNews research failed: {e}")
 
-            # LLM research: use GPT by default for research, with Claude as a secondary check
             research_prompt = clean_indents(f"""
                 You are an assistant to a superforecaster. Be concise and factual.
                 Question: {question.question_text}
@@ -347,15 +346,15 @@ class FinalTournamentBot2025(ForecastBot):
                 return []
 
     # -----------------------------
-    # Forecasting methods (2-model ensemble + stats)
+    # Forecasting methods
     # -----------------------------
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str, run_id: int, model_tag: str) -> ReasonedPrediction[float]:
         prompt = clean_indents(f"""
             You are a professional superforecaster. Be decisive and avoid hedging.
-            You must output a single final probability and it must be internally consistent with your reasoning.
+            Output a single final probability consistent with your reasoning.
 
             Run: {run_id} / Model: {model_tag}
-            Requirement: Take a distinct perspective from other runs (different reference class or causal model).
+            Requirement: Use a distinct angle vs other runs (different reference class or causal model).
 
             Question: {question.question_text}
             Background: {question.background_info}
@@ -380,25 +379,18 @@ class FinalTournamentBot2025(ForecastBot):
         llm = self._get_forecaster_llm(model_tag)
         reasoning = await llm.invoke(prompt)
 
-        pred: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
-        )
-
-        try:
-            val = float(pred.prediction_in_decimal)
-        except (ValueError, TypeError):
-            val = 0.5
-
-        decimal_pred = max(0.01, min(0.99, val))
+        pred: BinaryPrediction = await structure_output(reasoning, BinaryPrediction, model=self.get_llm("parser", "llm"))
+        val = safe_float(getattr(pred, "prediction_in_decimal", None), default=0.5)
+        decimal_pred = max(0.01, min(0.99, float(val)))
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str, run_id: int, model_tag: str) -> ReasonedPrediction[PredictedOptionList]:
         prompt = clean_indents(f"""
             You are a professional superforecaster. Be decisive and avoid hedging.
-            You must allocate probabilities across options that sum to 100%.
+            Allocate probabilities across options that sum to 100%.
 
             Run: {run_id} / Model: {model_tag}
-            Requirement: Take a distinct perspective from other runs (different reference class or causal model).
+            Requirement: Use a distinct angle vs other runs.
 
             Question: {question.question_text}
             Options: {question.options}
@@ -434,10 +426,10 @@ class FinalTournamentBot2025(ForecastBot):
 
         prompt = clean_indents(f"""
             You are a professional superforecaster. Be decisive and avoid hedging.
-            You must output coherent percentiles (monotonic increasing).
+            Output coherent percentiles (monotonic increasing).
 
             Run: {run_id} / Model: {model_tag}
-            Requirement: Take a distinct perspective from other runs (different reference class or causal model).
+            Requirement: Use a distinct angle vs other runs.
 
             Question: {question.question_text}
             Background: {question.background_info}
@@ -477,23 +469,45 @@ class FinalTournamentBot2025(ForecastBot):
             reasoning, list[Percentile], model=self.get_llm("parser", "llm")
         )
 
+        # ✅ Critical fix: normalize BOTH percentile and value types
         clean_percentiles: list[Percentile] = []
         for p in percentile_list:
             try:
-                v_str = str(p.value).replace(",", "").replace("%", "").strip()
-                val = float(v_str)
-                clean_percentiles.append(Percentile(value=val, percentile=p.percentile))
-            except (ValueError, TypeError):
+                val = safe_float(getattr(p, "value", None), default=None)
+                if val is None:
+                    continue
+                perc = normalize_percentile(getattr(p, "percentile", 0.5))
+                clean_percentiles.append(Percentile(value=float(val), percentile=float(perc)))
+            except Exception:
                 continue
 
+        # If parsing failed, fallback to midpoint
         if not clean_percentiles:
-            mid = 0.0
-            if (question.lower_bound is not None) and (question.upper_bound is not None):
-                try:
-                    mid = (float(question.lower_bound) + float(question.upper_bound)) / 2.0
-                except Exception:
-                    mid = 0.0
+            try:
+                l = float(question.lower_bound) if question.lower_bound is not None else 0.0
+            except Exception:
+                l = 0.0
+            try:
+                u = float(question.upper_bound) if question.upper_bound is not None else 100.0
+            except Exception:
+                u = 100.0
+            mid = (l + u) / 2.0
             clean_percentiles = [Percentile(value=mid, percentile=0.5)]
+
+        # Enforce monotonic values by percentile
+        clean_percentiles.sort(key=lambda x: float(x.percentile))
+        for i in range(1, len(clean_percentiles)):
+            if clean_percentiles[i].value < clean_percentiles[i - 1].value:
+                clean_percentiles[i].value = clean_percentiles[i - 1].value
+
+        # Guard against rare NaNs
+        clean_percentiles = [
+            Percentile(percentile=float(p.percentile), value=float(p.value))
+            for p in clean_percentiles
+            if _is_num(p.percentile) and _is_num(p.value)
+        ]
+        if not clean_percentiles:
+            clean_percentiles = [Percentile(value=0.0, percentile=0.5)]
 
         dist = NumericDistribution.from_question(clean_percentiles, question)
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
@@ -514,13 +528,12 @@ class FinalTournamentBot2025(ForecastBot):
         return low_msg, high_msg
 
     # -----------------------------
-    # Type-safe aggregation + stats
+    # Aggregation + stats
     # -----------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
         predictions: list[Any] = []
         reasonings: list[str] = []
 
-        # 5 runs alternating ONLY between GPT-5.2 and Sonnet-4.5
         for i, model_tag in enumerate(self._run_schedule, start=1):
             try:
                 if isinstance(question, BinaryQuestion):
@@ -541,48 +554,54 @@ class FinalTournamentBot2025(ForecastBot):
         if not predictions:
             raise RuntimeError("All forecasters failed.")
 
-        final_pred: Any = None
-
+        # -------------------------
+        # Binary aggregation
+        # -------------------------
         if isinstance(question, BinaryQuestion):
-            numeric_preds = [p for p in predictions if isinstance(p, (int, float)) and not isinstance(p, bool)]
+            numeric_preds = [float(p) for p in predictions if _is_num(p)]
             if not numeric_preds:
                 numeric_preds = [0.5]
 
             med = median(numeric_preds)
-            m = mean([float(x) for x in numeric_preds])
-            s = stdev([float(x) for x in numeric_preds])
-            lo, hi = ci90([float(x) for x in numeric_preds])
+            m = mean(numeric_preds)
+            s = stdev(numeric_preds)
+            lo, hi = ci90(numeric_preds)
 
-            # "Very confident" presentation, backed by agreement stats
             stats_line = f"[stats] n={len(numeric_preds)} mean={m:.3f} median={med:.3f} sd={s:.3f} ci90=({lo:.3f},{hi:.3f})"
-            final_pred = ReasonedPrediction(
+            return ReasonedPrediction(
                 prediction_value=max(0.01, min(0.99, float(med))),
                 reasoning=stats_line + " | " + " | ".join(reasonings),
             )
 
-        elif isinstance(question, MultipleChoiceQuestion):
-            options = question.options
+        # -------------------------
+        # Multiple-choice aggregation
+        # -------------------------
+        if isinstance(question, MultipleChoiceQuestion):
+            options = list(question.options)
             per_option_samples: Dict[str, List[float]] = {opt: [] for opt in options}
 
-            # Collect samples WITHOUT defaulting missing options to 0
             for p in predictions:
                 if isinstance(p, PredictedOptionList):
-                    pred_dict = {po.option_name.strip(): po.probability for po in p.predicted_options}
+                    pred_dict = {str(po.option_name).strip(): po.probability for po in p.predicted_options}
                     for opt in options:
-                        # normalize name match a bit
-                        prob = pred_dict.get(opt) or pred_dict.get(opt.strip())
-                        if prob is not None and isinstance(prob, (int, float)) and not isinstance(prob, bool):
-                            per_option_samples[opt].append(float(prob))
+                        # try exact then casefold
+                        v = pred_dict.get(opt)
+                        if v is None:
+                            v = pred_dict.get(opt.strip())
+                        if v is None:
+                            # casefold match
+                            opt_cf = opt.casefold()
+                            for k, vv in pred_dict.items():
+                                if k.casefold() == opt_cf:
+                                    v = vv
+                                    break
+                        if v is not None and _is_num(v):
+                            per_option_samples[opt].append(float(v))
 
-            # Median per option across available samples; if missing entirely, give tiny floor
             avg_probs: Dict[str, float] = {}
             for opt in options:
-                if per_option_samples[opt]:
-                    avg_probs[opt] = median(per_option_samples[opt])
-                else:
-                    avg_probs[opt] = 0.0001
+                avg_probs[opt] = median(per_option_samples[opt]) if per_option_samples[opt] else 0.0001
 
-            # Normalize
             total = sum(avg_probs.values())
             if total > 0:
                 avg_probs = {k: v / total for k, v in avg_probs.items()}
@@ -591,15 +610,18 @@ class FinalTournamentBot2025(ForecastBot):
             stats_line = f"[stats] n_runs={len(predictions)} entropy={ent:.3f} (lower=more confident)"
 
             predicted_options_list = [
-                PredictedOption(option_name=opt, probability=prob)
+                PredictedOption(option_name=opt, probability=float(prob))
                 for opt, prob in avg_probs.items()
             ]
-            final_pred = ReasonedPrediction(
+            return ReasonedPrediction(
                 prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
                 reasoning=stats_line + " | " + " | ".join(reasonings),
             )
 
-        elif isinstance(question, NumericQuestion):
+        # -------------------------
+        # Numeric aggregation
+        # -------------------------
+        if isinstance(question, NumericQuestion):
             target_pts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
             median_percentiles: list[Percentile] = []
 
@@ -608,54 +630,46 @@ class FinalTournamentBot2025(ForecastBot):
                 for p in predictions:
                     if isinstance(p, NumericDistribution):
                         for item in p.declared_percentiles:
-                            try:
-                                val = float(str(item.value).replace(",", "").strip())
-                            except (ValueError, TypeError):
-                                continue
-
-                            try:
-                                p_val = float(item.percentile)
-                                is_match = abs(p_val - pt) < 0.01 or abs(p_val - (pt * 100.0)) < 1.0
-                                if is_match:
-                                    vals.append(val)
-                            except Exception:
-                                continue
+                            perc = normalize_percentile(getattr(item, "percentile", None))
+                            if abs(perc - pt) < 0.011:
+                                val = safe_float(getattr(item, "value", None), default=None)
+                                if val is not None:
+                                    vals.append(float(val))
 
                 if vals:
                     med_val = median(vals)
                 else:
-                    l = question.lower_bound if question.lower_bound is not None else 0.0
-                    u = question.upper_bound if question.upper_bound is not None else 100.0
+                    # bounds midpoint fallback, robust to string bounds
                     try:
-                        med_val = (float(l) + float(u)) / 2.0
+                        l = float(question.lower_bound) if question.lower_bound is not None else 0.0
                     except Exception:
-                        med_val = 0.0
+                        l = 0.0
+                    try:
+                        u = float(question.upper_bound) if question.upper_bound is not None else 100.0
+                    except Exception:
+                        u = 100.0
+                    med_val = (l + u) / 2.0
 
-                median_percentiles.append(Percentile(percentile=pt, value=med_val))
+                median_percentiles.append(Percentile(percentile=pt, value=float(med_val)))
 
-            # Enforce monotonic percentiles
             median_percentiles.sort(key=lambda x: float(x.percentile))
             for i in range(1, len(median_percentiles)):
                 if median_percentiles[i].value < median_percentiles[i - 1].value:
                     median_percentiles[i].value = median_percentiles[i - 1].value
 
-            # Spread metric (uncertainty proxy)
             p10 = next((p.value for p in median_percentiles if abs(float(p.percentile) - 0.1) < 1e-9), None)
             p90 = next((p.value for p in median_percentiles if abs(float(p.percentile) - 0.9) < 1e-9), None)
             spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
-            stats_line = f"[stats] n_runs={len(predictions)} p10={p10:.3f} p90={p90:.3f} spread(p90-p10)={spread:.3f}"
+            stats_line = f"[stats] n_runs={len(predictions)} p10={float(p10):.3f} p90={float(p90):.3f} spread(p90-p10)={float(spread):.3f}"
 
             final_dist = NumericDistribution.from_question(median_percentiles, question)
-            final_pred = ReasonedPrediction(
+            return ReasonedPrediction(
                 prediction_value=final_dist,
                 reasoning=stats_line + " | " + " | ".join(reasonings),
             )
 
-        else:
-            final_pred = ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
-
-        return final_pred
-
+        # Fallback
+        return ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
 
 # -----------------------------
 # MAIN
