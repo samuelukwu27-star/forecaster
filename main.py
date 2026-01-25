@@ -41,7 +41,7 @@ from forecasting_tools import (
 )
 
 # -----------------------------
-# Helpers: robust stats (unchanged)
+# Helpers: robust stats
 # -----------------------------
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -99,7 +99,7 @@ def normalize_percentile(p: Any) -> float:
     return perc
 
 # -----------------------------
-# ASKNEWS QUERY BUILDER (unchanged)
+# ASKNEWS QUERY BUILDER
 # -----------------------------
 def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
     q = (question.question_text or "").strip()
@@ -146,7 +146,7 @@ def _get_tavily_client() -> Optional['TavilyClient']:
         return None
     return TavilyClient(api_key=api_key)
 
-def _sync_tavily_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+def _sync_tavily_search(query: str, max_results: int = 5) -> List[str]:
     client = _get_tavily_client()
     if client is None:
         return []
@@ -212,7 +212,7 @@ class FinalTournamentBot2025(ForecastBot):
         self._run_schedule = ["gpt", "claude", "gpt", "claude", "gpt"]
 
     # -----------------------------
-    # AskNews Client (fixed URLs)
+    # AskNews Client
     # -----------------------------
     def _get_asknews_client(self):
         if self._asknews_client is not None:
@@ -229,7 +229,7 @@ class FinalTournamentBot2025(ForecastBot):
                 scopes=["news"],
             )
         else:
-            auth_url = "https://api.asknews.app/v1/oauth/token"  # FIXED
+            auth_url = "https://api.asknews.app/v1/oauth/token"  # FIXED: no trailing space
             data = {
                 "grant_type": "client_credentials",
                 "client_id": ASKNEWS_CLIENT_ID,
@@ -295,7 +295,7 @@ class FinalTournamentBot2025(ForecastBot):
             }
             try:
                 resp = requests.get(
-                    "https://api.asknews.app/v1/news",  # FIXED
+                    "https://api.asknews.app/v1/news",  # FIXED: no trailing space
                     headers=headers,
                     params=params,
                     timeout=15,
@@ -309,7 +309,7 @@ class FinalTournamentBot2025(ForecastBot):
                 return []
 
     # -----------------------------
-    # Research (now with Tavily!)
+    # Research
     # -----------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
@@ -389,7 +389,7 @@ class FinalTournamentBot2025(ForecastBot):
             )
 
     # -----------------------------
-    # Internal forecast helpers (with run_id/model_tag)
+    # Internal forecast helpers
     # -----------------------------
     async def _run_forecast_on_binary_internal(
         self, question: BinaryQuestion, research: str, run_id: int, model_tag: str
@@ -425,10 +425,10 @@ class FinalTournamentBot2025(ForecastBot):
         reasoning = await llm.invoke(prompt)
 
         pred: BinaryPrediction = await structure_output(
-            reasoning, 
-            BinaryPrediction, 
+            text_to_structure=reasoning,
+            output_type=BinaryPrediction,
             model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples
+            num_validation_samples=self._structure_output_validation_samples,
         )
         val = safe_float(getattr(pred, "prediction_in_decimal", None), default=0.5)
         decimal_pred = max(0.01, min(0.99, float(val)))
@@ -468,11 +468,11 @@ class FinalTournamentBot2025(ForecastBot):
         reasoning = await llm.invoke(prompt)
 
         pred: PredictedOptionList = await structure_output(
-            reasoning,
-            PredictedOptionList,
-            self.get_llm("parser", "llm"),
-            parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples
+            text_to_structure=reasoning,
+            output_type=PredictedOptionList,
+            model=self.get_llm("parser", "llm"),
+            additional_instructions=parsing_instructions,
+            num_validation_samples=self._structure_output_validation_samples,
         )
         return ReasonedPrediction(prediction_value=pred, reasoning=reasoning)
 
@@ -524,10 +524,10 @@ class FinalTournamentBot2025(ForecastBot):
         reasoning = await llm.invoke(prompt)
 
         percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
+            text_to_structure=reasoning,
+            output_type=list[Percentile],
             model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples
+            num_validation_samples=self._structure_output_validation_samples,
         )
 
         clean_percentiles: list[Percentile] = []
@@ -585,7 +585,7 @@ class FinalTournamentBot2025(ForecastBot):
         return low_msg, high_msg
 
     # -----------------------------
-    # Abstract method implementations (minimal signature)
+    # Abstract method implementations
     # -----------------------------
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
@@ -603,7 +603,7 @@ class FinalTournamentBot2025(ForecastBot):
         return await self._run_forecast_on_numeric_internal(question, research, run_id=1, model_tag="gpt")
 
     # -----------------------------
-    # Custom aggregation (your core logic)
+    # Custom aggregation
     # -----------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
         predictions: list[Any] = []
@@ -629,7 +629,7 @@ class FinalTournamentBot2025(ForecastBot):
         if not predictions:
             raise RuntimeError("All forecasters failed.")
 
-        # ... [rest of your aggregation logic unchanged] ...
+        # BINARY
         if isinstance(question, BinaryQuestion):
             numeric_preds = [float(p) for p in predictions if _is_num(p)]
             if not numeric_preds:
@@ -644,6 +644,7 @@ class FinalTournamentBot2025(ForecastBot):
                 reasoning=stats_line + " | " + " | ".join(reasonings),
             )
 
+        # MULTIPLE CHOICE
         if isinstance(question, MultipleChoiceQuestion):
             options = list(question.options)
             per_option_samples: Dict[str, List[float]] = {opt: [] for opt in options}
@@ -679,6 +680,7 @@ class FinalTournamentBot2025(ForecastBot):
                 reasoning=stats_line + " | " + " | ".join(reasonings),
             )
 
+        # NUMERIC
         if isinstance(question, NumericQuestion):
             target_pts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
             median_percentiles: list[Percentile] = []
