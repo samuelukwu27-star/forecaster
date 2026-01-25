@@ -5,26 +5,23 @@ import os
 import textwrap
 import re
 import math
-from datetime import datetime, date
-from typing import List, Union, Dict, Any, Optional
-from scipy.stats import norm
+from datetime import datetime
+from typing import List, Union, Dict, Any, Literal, Optional
 
-# -----------------------------
-# External SDKs (with fallbacks)
-# -----------------------------
+# Optional: Tavily
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
 
+# AskNews integration
 try:
     from asknews_sdk import AskNewsSDK
     ASKNEWS_SDK_AVAILABLE = True
 except ImportError:
     ASKNEWS_SDK_AVAILABLE = False
     import requests
-
-try:
-    from tavily import TavilyClient
-    TAVILY_SDK_AVAILABLE = True
-except ImportError:
-    TAVILY_SDK_AVAILABLE = False
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -40,10 +37,11 @@ from forecasting_tools import (
     ReasonedPrediction,
     clean_indents,
     structure_output,
+    GeneralLlm,
 )
 
 # -----------------------------
-# Helpers
+# Helpers: robust stats (unchanged)
 # -----------------------------
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -94,15 +92,24 @@ def normalize_percentile(p: Any) -> float:
     perc = safe_float(p, default=0.5)
     if perc > 1.0:
         perc = perc / 100.0
-    return max(0.0, min(1.0, perc))
+    if perc < 0.0:
+        perc = 0.0
+    if perc > 1.0:
+        perc = 1.0
+    return perc
 
+# -----------------------------
+# ASKNEWS QUERY BUILDER (unchanged)
+# -----------------------------
 def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
     q = (question.question_text or "").strip()
     bg = (question.background_info or "").strip()
+
     q = re.sub(r"http\S+", "", q)
     bg = re.sub(r"http\S+", "", bg)
     q = re.sub(r"\s+", " ", q).strip()
     bg = re.sub(r"\s+", " ", bg).strip()
+
     if len(q) <= max_chars:
         if not bg:
             return q
@@ -114,19 +121,57 @@ def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> st
             bg_part = textwrap.shorten(bg, width=space_for_bg, placeholder="…")
             return f"{q} — {bg_part}"
         return q
+
     first_sent = q.split(".")[0].strip()
     if len(first_sent) > max_chars:
         return textwrap.shorten(first_sent, width=max_chars, placeholder="…")
+
     remaining = max_chars - len(first_sent) - 3
     if remaining > 10 and bg:
         bg_part = textwrap.shorten(bg, width=remaining, placeholder="…")
         combo = f"{first_sent} — {bg_part}"
         if len(combo) <= max_chars:
             return combo
+
     return textwrap.shorten(q, width=max_chars, placeholder="…")
 
 # -----------------------------
-# Logging & Setup
+# Tavily Integration
+# -----------------------------
+def _get_tavily_client() -> Optional['TavilyClient']:
+    if not TAVILY_AVAILABLE:
+        return None
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return None
+    return TavilyClient(api_key=api_key)
+
+def _sync_tavily_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+    client = _get_tavily_client()
+    if client is None:
+        return []
+    try:
+        response = client.search(
+            query=query,
+            search_depth="advanced",
+            include_answer=False,
+            max_results=max_results,
+            include_raw_content=False,
+        )
+        results = response.get("results", [])
+        snippets = []
+        for i, res in enumerate(results[:max_results]):
+            title = res.get("title", "Untitled")
+            content = res.get("content", "")[:500]
+            snippet = f"[T{i+1}] {title}: {textwrap.shorten(content, width=240, placeholder='…')}"
+            snippets.append(snippet)
+        return snippets
+    except Exception as e:
+        logger.error(f"Tavily search error: {e}")
+        return []
+
+# -----------------------------
+# Bot Class
 # -----------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -137,42 +182,46 @@ logger = logging.getLogger("FinalTournamentBot2025")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET")
 ASKNEWS_ENABLED = bool(ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET)
+if not ASKNEWS_ENABLED:
+    logger.warning("ASKNEWS_CLIENT_ID/ASKNEWS_CLIENT_SECRET not set — AskNews disabled.")
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-TAVILY_ENABLED = bool(TAVILY_API_KEY)
+TAVILY_ENABLED = TAVILY_AVAILABLE and bool(os.getenv("TAVILY_API_KEY"))
+if not TAVILY_ENABLED:
+    logger.warning("TAVILY_API_KEY not set — Tavily disabled.")
 
 class FinalTournamentBot2025(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
+    _structure_output_validation_samples = 2
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            # Forecasters
+            "researcher_gpt": "openrouter/openai/gpt-5.2",
+            "researcher_claude": "openrouter/anthropic/claude-sonnet-4.5",
             "forecaster_gpt": "openrouter/openai/gpt-5.2",
             "forecaster_claude": "openrouter/anthropic/claude-sonnet-4.5",
-            # Parser
             "parser": "openrouter/anthropic/claude-sonnet-4.5",
-            # NEW: Summarizer (factual compression only)
-            "summarizer": "openrouter/anthropic/claude-sonnet-4.5",
-            # NEW: Default fallback LLM
-            "default_llm": "openrouter/anthropic/claude-sonnet-4.5",
         })
         return defaults
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._asknews_client = None
-        logger.info("Initialized FinalTournamentBot2025 (AskNews + Tavily + Summarizer + Default LLM)")
-
+        logger.info("Initialized FinalTournamentBot2025 (AskNews + Tavily + 2-model ensemble)")
         self._run_schedule = ["gpt", "claude", "gpt", "claude", "gpt"]
 
+    # -----------------------------
+    # AskNews Client (fixed URLs)
+    # -----------------------------
     def _get_asknews_client(self):
         if self._asknews_client is not None:
             return self._asknews_client
+
         if not ASKNEWS_ENABLED:
             self._asknews_client = None
             return None
+
         if ASKNEWS_SDK_AVAILABLE:
             self._asknews_client = AskNewsSDK(
                 client_id=ASKNEWS_CLIENT_ID,
@@ -180,7 +229,7 @@ class FinalTournamentBot2025(ForecastBot):
                 scopes=["news"],
             )
         else:
-            auth_url = "https://api.asknews.app/v1/oauth/token"
+            auth_url = "https://api.asknews.app/v1/oauth/token"  # FIXED
             data = {
                 "grant_type": "client_credentials",
                 "client_id": ASKNEWS_CLIENT_ID,
@@ -195,24 +244,36 @@ class FinalTournamentBot2025(ForecastBot):
             except Exception as e:
                 logger.error(f"Failed to authenticate with AskNews API: {e}")
                 self._asknews_client = None
+
         return self._asknews_client
 
     def _sync_asknews_search(self, query: str) -> List[Any]:
         client = self._get_asknews_client()
         if client is None:
             return []
+
         if ASKNEWS_SDK_AVAILABLE:
             try:
-                method = getattr(client.news, "search_news", None) or getattr(client.news, "search_stories", None)
-                if not method:
-                    raise AttributeError("AskNews client lacks search method")
-                response = method(
-                    query=query,
-                    n_articles=5,
-                    return_type="news",
-                    use_neural_search=False,
-                    return_story_text=True,
-                )
+                if hasattr(client.news, "search_news"):
+                    response = client.news.search_news(
+                        query=query,
+                        n_articles=5,
+                        return_type="news",
+                        method="kw",
+                        return_story_text=True,
+                    )
+                elif hasattr(client.news, "search_stories"):
+                    response = client.news.search_stories(
+                        query=query,
+                        n_articles=5,
+                        return_type="news",
+                        use_neural_search=False,
+                        return_story_text=True,
+                        return_story_summary=False,
+                    )
+                else:
+                    raise AttributeError("AskNews client has neither search_news nor search_stories")
+
                 if hasattr(response, "news"):
                     return response.news
                 if hasattr(response, "as_dict"):
@@ -234,7 +295,7 @@ class FinalTournamentBot2025(ForecastBot):
             }
             try:
                 resp = requests.get(
-                    "https://api.asknews.app/v1/news",
+                    "https://api.asknews.app/v1/news",  # FIXED
                     headers=headers,
                     params=params,
                     timeout=15,
@@ -248,122 +309,265 @@ class FinalTournamentBot2025(ForecastBot):
                 return []
 
     # -----------------------------
-    # SUMMARIZER: Compress evidence (NO reasoning)
-    # -----------------------------
-    async def _summarize_evidence(self, raw_evidence: str) -> str:
-        """
-        Use LLM ONLY to compress long evidence into ≤200 words.
-        Strictly factual. No interpretation.
-        """
-        prompt = clean_indents(f"""
-            You are a factual summarizer. Your task is to condense the following evidence into a concise, neutral summary.
-
-            RULES:
-            - Include only dated facts, statistics, or direct quotes.
-            - Do NOT interpret, predict, or infer.
-            - Do NOT mention probabilities or outcomes.
-            - Keep under 200 words.
-
-            Evidence:
-            {raw_evidence}
-
-            Summary:
-        """)
-        try:
-            summarizer = self.get_llm("summarizer", "llm")
-            summary = await summarizer.invoke(prompt)
-            return summary.strip()
-        except Exception as e:
-            logger.warning(f"Summarizer failed: {e}. Using raw evidence.")
-            return raw_evidence  # fallback
-
-    # -----------------------------
-    # RESEARCH + SUMMARIZATION
+    # Research (now with Tavily!)
     # -----------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             today_str = datetime.now().strftime("%Y-%m-%d")
             query = build_asknews_query(question)
-            evidence_lines = [f"CURRENT DATE: {today_str}"]
 
+            # --- AskNews ---
+            asknews_summary = "[AskNews disabled]"
             if ASKNEWS_ENABLED:
                 try:
                     loop = asyncio.get_running_loop()
                     stories = await loop.run_in_executor(None, self._sync_asknews_search, query)
                     if stories:
-                        evidence_lines.append("\n[RECENT NEWS]")
+                        snippets = []
                         for i, story in enumerate(stories[:5]):
                             if isinstance(story, dict):
                                 title = story.get("title", "Untitled")
-                                text = (story.get("text") or "")[:300]
-                                pub_date = story.get("publish_date", "")
+                                text = (story.get("text") or "")[:500]
                             else:
                                 title = getattr(story, "title", "Untitled")
-                                text = (getattr(story, "text", "") or "")[:300]
-                                pub_date = getattr(story, "publish_date", "")
-                            snippet = f"{i+1}. ({pub_date}) {title}: {textwrap.shorten(text, 200)}"
-                            evidence_lines.append(snippet)
+                                text = (getattr(story, "text", "") or "")[:500]
+                            snippet = f"[A{i+1}] {title}: {textwrap.shorten(text, width=240, placeholder='…')}"
+                            snippets.append(snippet)
+                        asknews_summary = "\n".join(snippets)
                     else:
-                        evidence_lines.append("\n[RECENT NEWS: None found]")
+                        asknews_summary = "[AskNews: No recent stories found]"
                 except Exception as e:
-                    evidence_lines.append(f"\n[RECENT NEWS: Error - {str(e)}]")
+                    asknews_summary = f"[AskNews error: {str(e)}]"
+                    logger.error(f"AskNews research failed: {e}")
 
-            if TAVILY_ENABLED and TAVILY_SDK_AVAILABLE:
+            # --- Tavily ---
+            tavily_summary = "[Tavily disabled]"
+            if TAVILY_ENABLED:
                 try:
-                    tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-                    response = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: tavily_client.search(
-                            query=query,
-                            search_depth="advanced",
-                            max_results=3,
-                            include_answer=False,
-                        )
-                    )
-                    results = response.get("results", [])
-                    if results:
-                        evidence_lines.append("\n[GENERAL FACTS]")
-                        for i, res in enumerate(results[:3]):
-                            content = res.get("content", "")[:300]
-                            url = res.get("url", "")
-                            snippet = f"{i+1}. {textwrap.shorten(content, 200)} (Source: {url})"
-                            evidence_lines.append(snippet)
+                    loop = asyncio.get_running_loop()
+                    tavily_snippets = await loop.run_in_executor(None, _sync_tavily_search, query)
+                    if tavily_snippets:
+                        tavily_summary = "\n".join(tavily_snippets)
                     else:
-                        evidence_lines.append("\n[GENERAL FACTS: None found]")
+                        tavily_summary = "[Tavily: No results found]"
                 except Exception as e:
-                    evidence_lines.append(f"\n[GENERAL FACTS: Error - {str(e)}]")
+                    tavily_summary = f"[Tavily error: {str(e)}]"
+                    logger.error(f"Tavily research failed: {e}")
 
-            raw_evidence = "\n".join(evidence_lines)
-            # NEW: Summarize to reduce noise and length
-            summarized = await self._summarize_evidence(raw_evidence)
-            return summarized
+            # --- LLM Research ---
+            research_prompt = clean_indents(f"""
+                You are an assistant to a superforecaster. Be concise and factual.
+                Question: {question.question_text}
+                Resolution Criteria: {question.resolution_criteria}
+                Fine Print: {question.fine_print}
+
+                Task:
+                - Extract key facts (with dates if present)
+                - Identify base rates / reference class if applicable
+                - Identify the most decision-relevant variables
+                - Note what would falsify the main hypothesis
+                - Keep to <= 220 words
+            """)
+
+            try:
+                llm_main = self.get_llm("researcher_gpt", "llm")
+                llm_research_main = await llm_main.invoke(research_prompt)
+            except Exception as e:
+                llm_research_main = f"[LLM research (GPT) failed: {str(e)}]"
+
+            try:
+                llm_check = self.get_llm("researcher_claude", "llm")
+                llm_research_check = await llm_check.invoke(research_prompt)
+            except Exception as e:
+                llm_research_check = f"[LLM research (Claude) failed: {str(e)}]"
+
+            return (
+                f"--- ASKNEWS LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
+                f"--- TAVILY SEARCH RESULTS ---\n{tavily_summary}\n\n"
+                f"--- LLM RESEARCH (GPT-5.2) ---\n{llm_research_main}\n\n"
+                f"--- LLM RESEARCH (SONNET-4.5 CHECK) ---\n{llm_research_check}"
+            )
 
     # -----------------------------
-    # FORECASTING (LLM used here with principles)
+    # Internal forecast helpers (with run_id/model_tag)
     # -----------------------------
-    def _get_forecaster_llm(self, model_tag: str):
-        try:
-            return self.get_llm("forecaster_claude", "llm") if model_tag == "claude" else self.get_llm("forecaster_gpt", "llm")
-        except Exception:
-            logger.warning(f"Forecaster for {model_tag} unavailable. Using default LLM.")
-            return self.get_llm("default_llm", "llm")
-
-    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str, run_id: int, model_tag: str) -> ReasonedPrediction[float]:
-        days_to_res = (question.resolution_date - date.today()).days if question.resolution_date else "unknown"
+    async def _run_forecast_on_binary_internal(
+        self, question: BinaryQuestion, research: str, run_id: int, model_tag: str
+    ) -> ReasonedPrediction[float]:
         prompt = clean_indents(f"""
-            You are a top-tier superforecaster...
+            You are a professional superforecaster. Be decisive and avoid hedging.
+            Output a single final probability consistent with your reasoning.
 
-            [REST OF PROMPT UNCHANGED — see previous version]
+            Run: {run_id} / Model: {model_tag}
+            Requirement: Use a distinct angle vs other runs (different reference class or causal model).
+
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+
+            Research:
+            {research}
+
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+
+            Provide:
+            (a) Time until resolution
+            (b) Base rate / reference class
+            (c) Key drivers and current status quo
+            (d) Best case for NO
+            (e) Best case for YES
+
+            Final output EXACTLY:
+            Probability: ZZ%
         """)
-        llm = self._get_forecaster_llm(model_tag)
+        llm = self.get_llm(f"forecaster_{model_tag}", "llm")
         reasoning = await llm.invoke(prompt)
 
-        pred: BinaryPrediction = await structure_output(reasoning, BinaryPrediction, model=self.get_llm("parser", "llm"))
+        pred: BinaryPrediction = await structure_output(
+            reasoning, 
+            BinaryPrediction, 
+            model=self.get_llm("parser", "llm"),
+            num_validation_samples=self._structure_output_validation_samples
+        )
         val = safe_float(getattr(pred, "prediction_in_decimal", None), default=0.5)
         decimal_pred = max(0.01, min(0.99, float(val)))
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
 
-    # ... (keep _run_forecast_on_multiple_choice and _run_forecast_on_numeric unchanged)
+    async def _run_forecast_on_multiple_choice_internal(
+        self, question: MultipleChoiceQuestion, research: str, run_id: int, model_tag: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        prompt = clean_indents(f"""
+            You are a professional superforecaster. Be decisive and avoid hedging.
+            Allocate probabilities across options that sum to 100%.
+
+            Run: {run_id} / Model: {model_tag}
+            Requirement: Use a distinct angle vs other runs.
+
+            Question: {question.question_text}
+            Options: {question.options}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+
+            Research:
+            {research}
+
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+
+            Provide:
+            (a) Time until resolution
+            (b) Status quo and base rates
+            (c) Surprise scenario
+
+            Final output EXACTLY as:
+            {chr(10).join([f"{opt}: XX%" for opt in question.options])}
+        """)
+        parsing_instructions = f"Valid options: {question.options}"
+        llm = self.get_llm(f"forecaster_{model_tag}", "llm")
+        reasoning = await llm.invoke(prompt)
+
+        pred: PredictedOptionList = await structure_output(
+            reasoning,
+            PredictedOptionList,
+            self.get_llm("parser", "llm"),
+            parsing_instructions,
+            num_validation_samples=self._structure_output_validation_samples
+        )
+        return ReasonedPrediction(prediction_value=pred, reasoning=reasoning)
+
+    async def _run_forecast_on_numeric_internal(
+        self, question: NumericQuestion, research: str, run_id: int, model_tag: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        low_msg, high_msg = self._create_upper_and_lower_bound_messages(question)
+        unit = getattr(question, "unit_of_measure", "inferred")
+
+        prompt = clean_indents(f"""
+            You are a professional superforecaster. Be decisive and avoid hedging.
+            Output coherent percentiles (monotonic increasing).
+
+            Run: {run_id} / Model: {model_tag}
+            Requirement: Use a distinct angle vs other runs.
+
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Units: {unit}
+
+            Research:
+            {research}
+
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+
+            {low_msg}
+            {high_msg}
+
+            Provide:
+            (a) Time until resolution
+            (b) Base rate / reference class
+            (c) Trend continuation case
+            (d) Expert/market expectations
+            (e) Low-outcome scenario
+            (f) High-outcome scenario
+
+            Final output EXACTLY:
+            Percentile 10: X
+            Percentile 20: X
+            Percentile 40: X
+            Percentile 60: X
+            Percentile 80: X
+            Percentile 90: X
+        """)
+
+        llm = self.get_llm(f"forecaster_{model_tag}", "llm")
+        reasoning = await llm.invoke(prompt)
+
+        percentile_list: list[Percentile] = await structure_output(
+            reasoning,
+            list[Percentile],
+            model=self.get_llm("parser", "llm"),
+            num_validation_samples=self._structure_output_validation_samples
+        )
+
+        clean_percentiles: list[Percentile] = []
+        for p in percentile_list:
+            try:
+                val = safe_float(getattr(p, "value", None), default=None)
+                if val is None:
+                    continue
+                perc = normalize_percentile(getattr(p, "percentile", 0.5))
+                clean_percentiles.append(Percentile(value=float(val), percentile=float(perc)))
+            except Exception:
+                continue
+
+        if not clean_percentiles:
+            try:
+                l = float(question.lower_bound) if question.lower_bound is not None else 0.0
+            except Exception:
+                l = 0.0
+            try:
+                u = float(question.upper_bound) if question.upper_bound is not None else 100.0
+            except Exception:
+                u = 100.0
+            mid = (l + u) / 2.0
+            clean_percentiles = [Percentile(value=mid, percentile=0.5)]
+
+        clean_percentiles.sort(key=lambda x: float(x.percentile))
+        for i in range(1, len(clean_percentiles)):
+            if clean_percentiles[i].value < clean_percentiles[i - 1].value:
+                clean_percentiles[i].value = clean_percentiles[i - 1].value
+
+        clean_percentiles = [
+            Percentile(percentile=float(p.percentile), value=float(p.value))
+            for p in clean_percentiles
+            if _is_num(p.percentile) and _is_num(p.value)
+        ]
+        if not clean_percentiles:
+            clean_percentiles = [Percentile(value=0.0, percentile=0.5)]
+
+        dist = NumericDistribution.from_question(clean_percentiles, question)
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
     def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
         low = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
@@ -380,17 +584,152 @@ class FinalTournamentBot2025(ForecastBot):
         )
         return low_msg, high_msg
 
-    # ... (keep _make_prediction unchanged)
+    # -----------------------------
+    # Abstract method implementations (minimal signature)
+    # -----------------------------
+    async def _run_forecast_on_binary(
+        self, question: BinaryQuestion, research: str
+    ) -> ReasonedPrediction[float]:
+        return await self._run_forecast_on_binary_internal(question, research, run_id=1, model_tag="gpt")
+
+    async def _run_forecast_on_multiple_choice(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        return await self._run_forecast_on_multiple_choice_internal(question, research, run_id=1, model_tag="gpt")
+
+    async def _run_forecast_on_numeric(
+        self, question: NumericQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        return await self._run_forecast_on_numeric_internal(question, research, run_id=1, model_tag="gpt")
+
+    # -----------------------------
+    # Custom aggregation (your core logic)
+    # -----------------------------
+    async def _make_prediction(self, question: MetaculusQuestion, research: str):
+        predictions: list[Any] = []
+        reasonings: list[str] = []
+
+        for i, model_tag in enumerate(self._run_schedule, start=1):
+            try:
+                if isinstance(question, BinaryQuestion):
+                    pred = await self._run_forecast_on_binary_internal(question, research, run_id=i, model_tag=model_tag)
+                elif isinstance(question, MultipleChoiceQuestion):
+                    pred = await self._run_forecast_on_multiple_choice_internal(question, research, run_id=i, model_tag=model_tag)
+                elif isinstance(question, NumericQuestion):
+                    pred = await self._run_forecast_on_numeric_internal(question, research, run_id=i, model_tag=model_tag)
+                else:
+                    raise ValueError(f"Unsupported question type: {type(question)}")
+
+                predictions.append(pred.prediction_value)
+                reasonings.append(pred.reasoning)
+            except Exception as e:
+                logger.error(f"Individual forecaster failed (run {i}, model={model_tag}): {e}")
+                continue
+
+        if not predictions:
+            raise RuntimeError("All forecasters failed.")
+
+        # ... [rest of your aggregation logic unchanged] ...
+        if isinstance(question, BinaryQuestion):
+            numeric_preds = [float(p) for p in predictions if _is_num(p)]
+            if not numeric_preds:
+                numeric_preds = [0.5]
+            med = median(numeric_preds)
+            m = mean(numeric_preds)
+            s = stdev(numeric_preds)
+            lo, hi = ci90(numeric_preds)
+            stats_line = f"[stats] n={len(numeric_preds)} mean={m:.3f} median={med:.3f} sd={s:.3f} ci90=({lo:.3f},{hi:.3f})"
+            return ReasonedPrediction(
+                prediction_value=max(0.01, min(0.99, float(med))),
+                reasoning=stats_line + " | " + " | ".join(reasonings),
+            )
+
+        if isinstance(question, MultipleChoiceQuestion):
+            options = list(question.options)
+            per_option_samples: Dict[str, List[float]] = {opt: [] for opt in options}
+            for p in predictions:
+                if isinstance(p, PredictedOptionList):
+                    pred_dict = {str(po.option_name).strip(): po.probability for po in p.predicted_options}
+                    for opt in options:
+                        v = pred_dict.get(opt)
+                        if v is None:
+                            v = pred_dict.get(opt.strip())
+                        if v is None:
+                            opt_cf = opt.casefold()
+                            for k, vv in pred_dict.items():
+                                if k.casefold() == opt_cf:
+                                    v = vv
+                                    break
+                        if v is not None and _is_num(v):
+                            per_option_samples[opt].append(float(v))
+            avg_probs: Dict[str, float] = {}
+            for opt in options:
+                avg_probs[opt] = median(per_option_samples[opt]) if per_option_samples[opt] else 0.0001
+            total = sum(avg_probs.values())
+            if total > 0:
+                avg_probs = {k: v / total for k, v in avg_probs.items()}
+            ent = entropy(avg_probs)
+            stats_line = f"[stats] n_runs={len(predictions)} entropy={ent:.3f} (lower=more confident)"
+            predicted_options_list = [
+                PredictedOption(option_name=opt, probability=float(prob))
+                for opt, prob in avg_probs.items()
+            ]
+            return ReasonedPrediction(
+                prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
+                reasoning=stats_line + " | " + " | ".join(reasonings),
+            )
+
+        if isinstance(question, NumericQuestion):
+            target_pts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+            median_percentiles: list[Percentile] = []
+            for pt in target_pts:
+                vals: list[float] = []
+                for p in predictions:
+                    if isinstance(p, NumericDistribution):
+                        for item in p.declared_percentiles:
+                            perc = normalize_percentile(getattr(item, "percentile", None))
+                            if abs(perc - pt) < 0.011:
+                                val = safe_float(getattr(item, "value", None), default=None)
+                                if val is not None:
+                                    vals.append(float(val))
+                if vals:
+                    med_val = median(vals)
+                else:
+                    try:
+                        l = float(question.lower_bound) if question.lower_bound is not None else 0.0
+                    except Exception:
+                        l = 0.0
+                    try:
+                        u = float(question.upper_bound) if question.upper_bound is not None else 100.0
+                    except Exception:
+                        u = 100.0
+                    med_val = (l + u) / 2.0
+                median_percentiles.append(Percentile(percentile=pt, value=float(med_val)))
+            median_percentiles.sort(key=lambda x: float(x.percentile))
+            for i in range(1, len(median_percentiles)):
+                if median_percentiles[i].value < median_percentiles[i - 1].value:
+                    median_percentiles[i].value = median_percentiles[i - 1].value
+            p10 = next((p.value for p in median_percentiles if abs(float(p.percentile) - 0.1) < 1e-9), None)
+            p90 = next((p.value for p in median_percentiles if abs(float(p.percentile) - 0.9) < 1e-9), None)
+            spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
+            stats_line = f"[stats] n_runs={len(predictions)} p10={float(p10):.3f} p90={float(p90):.3f} spread(p90-p10)={float(spread):.3f}"
+            final_dist = NumericDistribution.from_question(median_percentiles, question)
+            return ReasonedPrediction(
+                prediction_value=final_dist,
+                reasoning=stats_line + " | " + " | ".join(reasonings),
+            )
+
+        return ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
 
 # -----------------------------
-# MAIN (unchanged)
+# MAIN
 # -----------------------------
 if __name__ == "__main__":
     litellm_logger = logging.getLogger("litellm")
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="FinalTournamentBot2025: Evidence-based forecasting with summarizer")
+    parser = argparse.ArgumentParser(description="Run FinalTournamentBot2025 (AskNews + Tavily + 2-model ensemble)")
     parser.add_argument(
         "--tournament-ids",
         nargs="+",
