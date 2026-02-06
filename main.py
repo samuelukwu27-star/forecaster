@@ -6,7 +6,7 @@ import textwrap
 import re
 import math
 from datetime import datetime
-from typing import List, Union, Dict, Any, Literal, Optional
+from typing import List, Union, Dict, Any, Optional, Tuple
 
 # Optional: Tavily
 try:
@@ -21,7 +21,7 @@ try:
     ASKNEWS_SDK_AVAILABLE = True
 except ImportError:
     ASKNEWS_SDK_AVAILABLE = False
-    import requests
+    import requests  # type: ignore
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -37,11 +37,10 @@ from forecasting_tools import (
     ReasonedPrediction,
     clean_indents,
     structure_output,
-    GeneralLlm,
 )
 
 # -----------------------------
-# Helpers: robust stats
+# Helpers: robust stats + parsing
 # -----------------------------
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -66,7 +65,7 @@ def stdev(xs: List[float]) -> float:
     m = mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
-def ci90(xs: List[float]) -> tuple[float, float]:
+def ci90(xs: List[float]) -> Tuple[float, float]:
     m = mean(xs)
     s = stdev(xs)
     se = s / math.sqrt(len(xs)) if xs else 0.0
@@ -82,21 +81,123 @@ def entropy(probs: Dict[str, float]) -> float:
             e -= p * math.log(p)
     return e
 
-def safe_float(x: Any, default: float = 0.0) -> float:
+def safe_float(x: Any, default: Optional[float] = 0.0) -> Optional[float]:
     try:
-        return float(str(x).replace(",", "").replace("%", "").strip())
+        if x is None:
+            return default
+        s = str(x).strip()
+        if not s:
+            return default
+        s = s.replace(",", "").replace("%", "").strip()
+        return float(s)
     except Exception:
         return default
 
 def normalize_percentile(p: Any) -> float:
     perc = safe_float(p, default=0.5)
+    if perc is None:
+        return 0.5
     if perc > 1.0:
         perc = perc / 100.0
     if perc < 0.0:
         perc = 0.0
     if perc > 1.0:
         perc = 1.0
-    return perc
+    return float(perc)
+
+def clamp01(p: float, lo: float = 0.01, hi: float = 0.99) -> float:
+    return max(lo, min(hi, float(p)))
+
+_PERCENT_RE = re.compile(r"(?i)\bprob(?:ability)?\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%")
+_DEC_RE = re.compile(r"(?i)\bdecimal\s*:\s*([0-9]*\.?[0-9]+)\b")
+
+def extract_binary_prob_from_text(text: str) -> Optional[float]:
+    """
+    Fallback extractor for binary probs.
+    Accepts:
+      - "Probability: 63%"
+      - "Decimal: 0.63"
+    Returns decimal in [0,1] or None.
+    """
+    if not text:
+        return None
+
+    m = _PERCENT_RE.search(text)
+    if m:
+        pct = safe_float(m.group(1), default=None)
+        if pct is None:
+            return None
+        return clamp01(pct / 100.0, 0.0, 1.0)
+
+    m = _DEC_RE.search(text)
+    if m:
+        dec = safe_float(m.group(1), default=None)
+        if dec is None:
+            return None
+        return clamp01(dec, 0.0, 1.0)
+
+    # Last resort: find a standalone percent like "63%"
+    m2 = re.search(r"(?<!\d)([0-9]{1,3}(?:\.[0-9]+)?)\s*%", text)
+    if m2:
+        pct = safe_float(m2.group(1), default=None)
+        if pct is None:
+            return None
+        return clamp01(pct / 100.0, 0.0, 1.0)
+
+    return None
+
+def build_indexed_options(options: List[str]) -> List[str]:
+    return [f"{i+1}) {opt}" for i, opt in enumerate(options)]
+
+def extract_indexed_mc_probs(text: str, n_options: int) -> Dict[int, float]:
+    """
+    Fallback extractor for multiple choice:
+      "1: 12%" or "1) 12%" or "Option 1: 12%"
+    Returns dict {index(1..n): prob_decimal}
+    """
+    out: Dict[int, float] = {}
+    if not text:
+        return out
+    patterns = [
+        re.compile(r"(?i)\b(?:option\s*)?(\d{1,2})\s*[:\)\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%"),
+        re.compile(r"(?i)\b(\d{1,2})\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*%"),
+    ]
+    for pat in patterns:
+        for m in pat.finditer(text):
+            idx = int(m.group(1))
+            if 1 <= idx <= n_options:
+                pct = safe_float(m.group(2), default=None)
+                if pct is None:
+                    continue
+                out[idx] = float(pct) / 100.0
+    return out
+
+def extract_numeric_percentiles(text: str, targets: List[float]) -> Dict[float, float]:
+    """
+    Fallback extractor for numeric percentiles:
+      "Percentile 10: X" or "P10: X"
+    Returns dict {target_percentile_decimal: value}
+    """
+    out: Dict[float, float] = {}
+    if not text:
+        return out
+
+    # capture 10/20/40/60/80/90 etc
+    for pt in targets:
+        pct_int = int(round(pt * 100))
+        pats = [
+            re.compile(rf"(?i)\bpercentile\s*{pct_int}\s*:\s*([-+]?[0-9,]*\.?[0-9]+)"),
+            re.compile(rf"(?i)\bp\s*{pct_int}\s*:\s*([-+]?[0-9,]*\.?[0-9]+)"),
+            re.compile(rf"(?i)\bp{pct_int}\s*=\s*([-+]?[0-9,]*\.?[0-9]+)"),
+        ]
+        for pat in pats:
+            m = pat.search(text)
+            if m:
+                v = safe_float(m.group(1), default=None)
+                if v is not None:
+                    out[pt] = float(v)
+                    break
+    return out
 
 # -----------------------------
 # ASKNEWS QUERY BUILDER
@@ -138,7 +239,7 @@ def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> st
 # -----------------------------
 # Tavily Integration
 # -----------------------------
-def _get_tavily_client() -> Optional['TavilyClient']:
+def _get_tavily_client() -> Optional["TavilyClient"]:
     if not TAVILY_AVAILABLE:
         return None
     api_key = os.getenv("TAVILY_API_KEY")
@@ -162,7 +263,7 @@ def _sync_tavily_search(query: str, max_results: int = 5) -> List[str]:
         snippets = []
         for i, res in enumerate(results[:max_results]):
             title = res.get("title", "Untitled")
-            content = res.get("content", "")[:500]
+            content = (res.get("content", "") or "")[:500]
             snippet = f"[T{i+1}] {title}: {textwrap.shorten(content, width=240, placeholder='…')}"
             snippets.append(snippet)
         return snippets
@@ -171,7 +272,7 @@ def _sync_tavily_search(query: str, max_results: int = 5) -> List[str]:
         return []
 
 # -----------------------------
-# Bot Class
+# Logging + env
 # -----------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -189,7 +290,25 @@ TAVILY_ENABLED = TAVILY_AVAILABLE and bool(os.getenv("TAVILY_API_KEY"))
 if not TAVILY_ENABLED:
     logger.warning("TAVILY_API_KEY not set — Tavily disabled.")
 
+# -----------------------------
+# Bot Class (2-model, 2 principles)
+# -----------------------------
 class FinalTournamentBot2025(ForecastBot):
+    """
+    Two-model setup:
+      - GPT-5.2: primary forecaster
+      - Claude Sonnet 4.5: adversarial checker (still outputs a forecast)
+
+    Two core Good Judgment principles enforced in prompts:
+      1) Outside view / base rates first.
+      2) Consider-the-opposite (steelman the opposite side) before finalizing.
+
+    Aggregation:
+      - Binary: weighted blend 0.7 GPT / 0.3 Claude
+      - Multiple choice: weighted blend per option, renormalize
+      - Numeric: weighted blend of percentile values
+    """
+
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
@@ -208,8 +327,19 @@ class FinalTournamentBot2025(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._asknews_client = None
-        logger.info("Initialized FinalTournamentBot2025 (AskNews + Tavily + 2-model ensemble)")
-        self._run_schedule = ["gpt", "claude", "gpt", "claude", "gpt"]
+        logger.info("Initialized FinalTournamentBot2025 (AskNews + Tavily + 2-model high-score intent)")
+        # Only 2 runs total
+        self._run_schedule = ["gpt", "claude"]
+
+        # Drop accounting
+        self._drop_counts: Dict[str, int] = {}
+        self._drop_counts_by_model: Dict[str, Dict[str, int]] = {"gpt": {}, "claude": {}}
+
+    def _inc_drop(self, model_tag: str, reason: str) -> None:
+        self._drop_counts[reason] = self._drop_counts.get(reason, 0) + 1
+        d = self._drop_counts_by_model.get(model_tag, {})
+        d[reason] = d.get(reason, 0) + 1
+        self._drop_counts_by_model[model_tag] = d
 
     # -----------------------------
     # AskNews Client
@@ -229,7 +359,7 @@ class FinalTournamentBot2025(ForecastBot):
                 scopes=["news"],
             )
         else:
-            auth_url = "https://api.asknews.app/v1/oauth/token"  # FIXED: no trailing space
+            auth_url = "https://api.asknews.app/v1/oauth/token"
             data = {
                 "grant_type": "client_credentials",
                 "client_id": ASKNEWS_CLIENT_ID,
@@ -295,7 +425,7 @@ class FinalTournamentBot2025(ForecastBot):
             }
             try:
                 resp = requests.get(
-                    "https://api.asknews.app/v1/news",  # FIXED: no trailing space
+                    "https://api.asknews.app/v1/news",
                     headers=headers,
                     params=params,
                     timeout=15,
@@ -309,14 +439,14 @@ class FinalTournamentBot2025(ForecastBot):
                 return []
 
     # -----------------------------
-    # Research
+    # Research (concise, scorer-friendly)
     # -----------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             today_str = datetime.now().strftime("%Y-%m-%d")
             query = build_asknews_query(question)
 
-            # --- AskNews ---
+            # AskNews + Tavily snippets (optional)
             asknews_summary = "[AskNews disabled]"
             if ASKNEWS_ENABLED:
                 try:
@@ -331,8 +461,7 @@ class FinalTournamentBot2025(ForecastBot):
                             else:
                                 title = getattr(story, "title", "Untitled")
                                 text = (getattr(story, "text", "") or "")[:500]
-                            snippet = f"[A{i+1}] {title}: {textwrap.shorten(text, width=240, placeholder='…')}"
-                            snippets.append(snippet)
+                            snippets.append(f"[A{i+1}] {title}: {textwrap.shorten(text, width=220, placeholder='…')}")
                         asknews_summary = "\n".join(snippets)
                     else:
                         asknews_summary = "[AskNews: No recent stories found]"
@@ -340,236 +469,201 @@ class FinalTournamentBot2025(ForecastBot):
                     asknews_summary = f"[AskNews error: {str(e)}]"
                     logger.error(f"AskNews research failed: {e}")
 
-            # --- Tavily ---
             tavily_summary = "[Tavily disabled]"
             if TAVILY_ENABLED:
                 try:
                     loop = asyncio.get_running_loop()
                     tavily_snippets = await loop.run_in_executor(None, _sync_tavily_search, query)
-                    if tavily_snippets:
-                        tavily_summary = "\n".join(tavily_snippets)
-                    else:
-                        tavily_summary = "[Tavily: No results found]"
+                    tavily_summary = "\n".join(tavily_snippets) if tavily_snippets else "[Tavily: No results found]"
                 except Exception as e:
                     tavily_summary = f"[Tavily error: {str(e)}]"
                     logger.error(f"Tavily research failed: {e}")
 
-            # --- LLM Research ---
+            # Single structured research pass (GPT) + brief Claude check for missing angle
             research_prompt = clean_indents(f"""
-                You are an assistant to a superforecaster. Be concise and factual.
+                You are helping a forecaster maximize scoring rules (log/Brier). Be concise and decision-relevant.
+                Two principles:
+                1) Outside view/base rates first.
+                2) Consider-the-opposite: strongest case for the other side.
+
                 Question: {question.question_text}
                 Resolution Criteria: {question.resolution_criteria}
                 Fine Print: {question.fine_print}
 
-                Task:
-                - Extract key facts (with dates if present)
-                - Identify base rates / reference class if applicable
-                - Identify the most decision-relevant variables
-                - Note what would falsify the main hypothesis
-                - Keep to <= 220 words
+                Output <= 200 words in this exact structure:
+                - Key facts (dated):
+                - Outside view / base rate:
+                - Main drivers to watch:
+                - Strongest case for opposite outcome:
+                - What would change your mind:
             """)
 
             try:
-                llm_main = self.get_llm("researcher_gpt", "llm")
-                llm_research_main = await llm_main.invoke(research_prompt)
+                llm_gpt = self.get_llm("researcher_gpt", "llm")
+                gpt_research = await llm_gpt.invoke(research_prompt)
             except Exception as e:
-                llm_research_main = f"[LLM research (GPT) failed: {str(e)}]"
+                gpt_research = f"[LLM research (GPT) failed: {str(e)}]"
 
             try:
-                llm_check = self.get_llm("researcher_claude", "llm")
-                llm_research_check = await llm_check.invoke(research_prompt)
+                llm_claude = self.get_llm("researcher_claude", "llm")
+                claude_gap_check = await llm_claude.invoke(clean_indents(f"""
+                    You are the adversarial checker. Find missing considerations that would materially change the forecast.
+                    Keep <= 120 words. Bullet points only.
+
+                    Question: {question.question_text}
+                    Resolution Criteria: {question.resolution_criteria}
+
+                    Research draft:
+                    {gpt_research}
+
+                    Output:
+                    - Missing consideration(s):
+                    - Potential direction of update (up/down) and why:
+                """))
             except Exception as e:
-                llm_research_check = f"[LLM research (Claude) failed: {str(e)}]"
+                claude_gap_check = f"[LLM gap-check (Claude) failed: {str(e)}]"
 
             return (
-                f"--- ASKNEWS LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
-                f"--- TAVILY SEARCH RESULTS ---\n{tavily_summary}\n\n"
-                f"--- LLM RESEARCH (GPT-5.2) ---\n{llm_research_main}\n\n"
-                f"--- LLM RESEARCH (SONNET-4.5 CHECK) ---\n{llm_research_check}"
+                f"--- LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
+                f"--- WEB SEARCH SNIPPETS ---\n{tavily_summary}\n\n"
+                f"--- STRUCTURED RESEARCH (GPT-5.2) ---\n{gpt_research}\n\n"
+                f"--- ADVERSARIAL GAP CHECK (SONNET-4.5) ---\n{claude_gap_check}"
             )
 
     # -----------------------------
-    # Internal forecast helpers
+    # Forecast invocation helpers (retry + fallbacks)
     # -----------------------------
-    async def _run_forecast_on_binary_internal(
-        self, question: BinaryQuestion, research: str, run_id: int, model_tag: str
-    ) -> ReasonedPrediction[float]:
-        prompt = clean_indents(f"""
-            You are a professional superforecaster. Be decisive and avoid hedging.
-            Output a single final probability consistent with your reasoning.
+    async def _invoke_llm(self, model_name: str, prompt: str) -> str:
+        llm = self.get_llm(model_name, "llm")
+        return await llm.invoke(prompt)
 
-            Run: {run_id} / Model: {model_tag}
-            Requirement: Use a distinct angle vs other runs (different reference class or causal model).
+    async def _invoke_with_format_retry(self, model_name: str, prompt: str, format_spec: str) -> str:
+        """
+        One retry if the first response likely violates format.
+        """
+        try:
+            return await self._invoke_llm(model_name, prompt)
+        except Exception:
+            raise
 
-            Question: {question.question_text}
-            Background: {question.background_info}
-            Resolution Criteria: {question.resolution_criteria}
-            Fine Print: {question.fine_print}
+    async def _parse_binary(self, raw: str, model_tag: str) -> Optional[float]:
+        # Structured parse attempt
+        try:
+            pred: BinaryPrediction = await structure_output(
+                text_to_structure=raw,
+                output_type=BinaryPrediction,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            val = safe_float(getattr(pred, "prediction_in_decimal", None), default=None)
+            if val is not None:
+                return clamp01(float(val))
+        except Exception:
+            self._inc_drop(model_tag, "parse_error_binary_structured")
 
-            Research:
-            {research}
+        # Fallback parse
+        val2 = extract_binary_prob_from_text(raw)
+        if val2 is None:
+            self._inc_drop(model_tag, "parse_error_binary_fallback")
+            return None
+        return clamp01(float(val2))
 
-            Today: {datetime.now().strftime('%Y-%m-%d')}
+    async def _parse_mc(self, raw: str, question: MultipleChoiceQuestion, model_tag: str) -> Optional[Dict[str, float]]:
+        options = list(question.options)
+        n = len(options)
 
-            Provide:
-            (a) Time until resolution
-            (b) Base rate / reference class
-            (c) Key drivers and current status quo
-            (d) Best case for NO
-            (e) Best case for YES
+        # Structured parse attempt
+        try:
+            pred: PredictedOptionList = await structure_output(
+                text_to_structure=raw,
+                output_type=PredictedOptionList,
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=f"Valid options: {options}. Prefer interpreting numbered options if present.",
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            pred_dict = {}
+            for po in pred.predicted_options:
+                name = str(po.option_name).strip()
+                prob = po.probability
+                if _is_num(prob):
+                    pred_dict[name] = float(prob)
+            # Map to canonical options (best-effort)
+            out: Dict[str, float] = {}
+            for opt in options:
+                if opt in pred_dict:
+                    out[opt] = pred_dict[opt]
+                else:
+                    # casefold match
+                    opt_cf = opt.casefold()
+                    for k, v in pred_dict.items():
+                        if k.casefold() == opt_cf:
+                            out[opt] = v
+                            break
+            if out:
+                return out
+        except Exception:
+            self._inc_drop(model_tag, "parse_error_mc_structured")
 
-            Final output EXACTLY:
-            Probability: ZZ%
-        """)
-        llm = self.get_llm(f"forecaster_{model_tag}", "llm")
-        reasoning = await llm.invoke(prompt)
+        # Fallback: indexed extraction
+        idx_probs = extract_indexed_mc_probs(raw, n)
+        if not idx_probs:
+            self._inc_drop(model_tag, "parse_error_mc_fallback")
+            return None
+        out2: Dict[str, float] = {}
+        for i in range(1, n + 1):
+            if i in idx_probs:
+                out2[options[i - 1]] = float(idx_probs[i])
+        if not out2:
+            self._inc_drop(model_tag, "parse_error_mc_fallback_empty")
+            return None
+        return out2
 
-        pred: BinaryPrediction = await structure_output(
-            text_to_structure=reasoning,
-            output_type=BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        val = safe_float(getattr(pred, "prediction_in_decimal", None), default=0.5)
-        decimal_pred = max(0.01, min(0.99, float(val)))
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+    async def _parse_numeric(self, raw: str, question: NumericQuestion, model_tag: str) -> Optional[NumericDistribution]:
+        targets = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
 
-    async def _run_forecast_on_multiple_choice_internal(
-        self, question: MultipleChoiceQuestion, research: str, run_id: int, model_tag: str
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = clean_indents(f"""
-            You are a professional superforecaster. Be decisive and avoid hedging.
-            Allocate probabilities across options that sum to 100%.
-
-            Run: {run_id} / Model: {model_tag}
-            Requirement: Use a distinct angle vs other runs.
-
-            Question: {question.question_text}
-            Options: {question.options}
-            Background: {question.background_info}
-            Resolution Criteria: {question.resolution_criteria}
-            Fine Print: {question.fine_print}
-
-            Research:
-            {research}
-
-            Today: {datetime.now().strftime('%Y-%m-%d')}
-
-            Provide:
-            (a) Time until resolution
-            (b) Status quo and base rates
-            (c) Surprise scenario
-
-            Final output EXACTLY as:
-            {chr(10).join([f"{opt}: XX%" for opt in question.options])}
-        """)
-        parsing_instructions = f"Valid options: {question.options}"
-        llm = self.get_llm(f"forecaster_{model_tag}", "llm")
-        reasoning = await llm.invoke(prompt)
-
-        pred: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        return ReasonedPrediction(prediction_value=pred, reasoning=reasoning)
-
-    async def _run_forecast_on_numeric_internal(
-        self, question: NumericQuestion, research: str, run_id: int, model_tag: str
-    ) -> ReasonedPrediction[NumericDistribution]:
-        low_msg, high_msg = self._create_upper_and_lower_bound_messages(question)
-        unit = getattr(question, "unit_of_measure", "inferred")
-
-        prompt = clean_indents(f"""
-            You are a professional superforecaster. Be decisive and avoid hedging.
-            Output coherent percentiles (monotonic increasing).
-
-            Run: {run_id} / Model: {model_tag}
-            Requirement: Use a distinct angle vs other runs.
-
-            Question: {question.question_text}
-            Background: {question.background_info}
-            Resolution Criteria: {question.resolution_criteria}
-            Fine Print: {question.fine_print}
-            Units: {unit}
-
-            Research:
-            {research}
-
-            Today: {datetime.now().strftime('%Y-%m-%d')}
-
-            {low_msg}
-            {high_msg}
-
-            Provide:
-            (a) Time until resolution
-            (b) Base rate / reference class
-            (c) Trend continuation case
-            (d) Expert/market expectations
-            (e) Low-outcome scenario
-            (f) High-outcome scenario
-
-            Final output EXACTLY:
-            Percentile 10: X
-            Percentile 20: X
-            Percentile 40: X
-            Percentile 60: X
-            Percentile 80: X
-            Percentile 90: X
-        """)
-
-        llm = self.get_llm(f"forecaster_{model_tag}", "llm")
-        reasoning = await llm.invoke(prompt)
-
-        percentile_list: list[Percentile] = await structure_output(
-            text_to_structure=reasoning,
-            output_type=list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-
-        clean_percentiles: list[Percentile] = []
-        for p in percentile_list:
-            try:
+        # Structured parse attempt
+        try:
+            percentile_list: List[Percentile] = await structure_output(
+                text_to_structure=raw,
+                output_type=list[Percentile],
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            clean_percentiles: List[Percentile] = []
+            for p in percentile_list:
                 val = safe_float(getattr(p, "value", None), default=None)
                 if val is None:
                     continue
                 perc = normalize_percentile(getattr(p, "percentile", 0.5))
                 clean_percentiles.append(Percentile(value=float(val), percentile=float(perc)))
-            except Exception:
-                continue
+            if clean_percentiles:
+                clean_percentiles.sort(key=lambda x: float(x.percentile))
+                for i in range(1, len(clean_percentiles)):
+                    if clean_percentiles[i].value < clean_percentiles[i - 1].value:
+                        clean_percentiles[i].value = clean_percentiles[i - 1].value
+                return NumericDistribution.from_question(clean_percentiles, question)
+        except Exception:
+            self._inc_drop(model_tag, "parse_error_numeric_structured")
 
-        if not clean_percentiles:
-            try:
-                l = float(question.lower_bound) if question.lower_bound is not None else 0.0
-            except Exception:
-                l = 0.0
-            try:
-                u = float(question.upper_bound) if question.upper_bound is not None else 100.0
-            except Exception:
-                u = 100.0
-            mid = (l + u) / 2.0
-            clean_percentiles = [Percentile(value=mid, percentile=0.5)]
+        # Fallback extraction
+        extracted = extract_numeric_percentiles(raw, targets)
+        if not extracted:
+            self._inc_drop(model_tag, "parse_error_numeric_fallback")
+            return None
 
-        clean_percentiles.sort(key=lambda x: float(x.percentile))
-        for i in range(1, len(clean_percentiles)):
-            if clean_percentiles[i].value < clean_percentiles[i - 1].value:
-                clean_percentiles[i].value = clean_percentiles[i - 1].value
+        pts: List[Percentile] = []
+        for pt in targets:
+            if pt in extracted:
+                pts.append(Percentile(percentile=pt, value=float(extracted[pt])))
 
-        clean_percentiles = [
-            Percentile(percentile=float(p.percentile), value=float(p.value))
-            for p in clean_percentiles
-            if _is_num(p.percentile) and _is_num(p.value)
-        ]
-        if not clean_percentiles:
-            clean_percentiles = [Percentile(value=0.0, percentile=0.5)]
+        pts.sort(key=lambda x: float(x.percentile))
+        for i in range(1, len(pts)):
+            if pts[i].value < pts[i - 1].value:
+                pts[i].value = pts[i - 1].value
 
-        dist = NumericDistribution.from_question(clean_percentiles, question)
-        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
+        return NumericDistribution.from_question(pts, question)
 
-    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
+    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> Tuple[str, str]:
         low = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
         high = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
         low_msg = (
@@ -585,143 +679,425 @@ class FinalTournamentBot2025(ForecastBot):
         return low_msg, high_msg
 
     # -----------------------------
-    # Abstract method implementations
+    # Core forecasting (GPT primary + Claude adversarial checker)
     # -----------------------------
-    async def _run_forecast_on_binary(
-        self, question: BinaryQuestion, research: str
-    ) -> ReasonedPrediction[float]:
-        return await self._run_forecast_on_binary_internal(question, research, run_id=1, model_tag="gpt")
+    def _binary_prompt(self, question: BinaryQuestion, research: str, role: str) -> str:
+        # Two Good Judgment principles baked in, plus scoring intent.
+        return clean_indents(f"""
+            You are forecasting to maximize proper scoring rules (log score / Brier). Be calibrated and decisive.
+            Apply exactly two principles:
+            1) Outside view / base rates first.
+            2) Consider-the-opposite: strongest case for the other side before finalizing.
 
-    async def _run_forecast_on_multiple_choice(
-        self, question: MultipleChoiceQuestion, research: str
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        return await self._run_forecast_on_multiple_choice_internal(question, research, run_id=1, model_tag="gpt")
+            Role: {role}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
 
-    async def _run_forecast_on_numeric(
-        self, question: NumericQuestion, research: str
-    ) -> ReasonedPrediction[NumericDistribution]:
-        return await self._run_forecast_on_numeric_internal(question, research, run_id=1, model_tag="gpt")
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+
+            Research:
+            {research}
+
+            Write 6-10 bullets total, then output EXACTLY these two lines at the end:
+            Probability: ZZ%
+            Decimal: 0.ZZ
+        """)
+
+    def _mc_prompt(self, question: MultipleChoiceQuestion, research: str, role: str) -> str:
+        options = list(question.options)
+        indexed = build_indexed_options(options)
+        return clean_indents(f"""
+            You are forecasting to maximize proper scoring rules. Be calibrated and decisive.
+            Apply exactly two principles:
+            1) Outside view / base rates first.
+            2) Consider-the-opposite: strongest case for the leading alternative.
+
+            Role: {role}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+
+            Options (numbered, MUST use these numbers in your final lines):
+            {chr(10).join(indexed)}
+
+            Research:
+            {research}
+
+            Write 6-10 bullets total, then output EXACTLY n lines at the end:
+            1: XX%
+            2: XX%
+            ...
+            {len(options)}: XX%
+            (These must sum to 100%.)
+        """)
+
+    def _numeric_prompt(self, question: NumericQuestion, research: str, role: str) -> str:
+        low_msg, high_msg = self._create_upper_and_lower_bound_messages(question)
+        unit = getattr(question, "unit_of_measure", "inferred")
+        return clean_indents(f"""
+            You are forecasting to maximize proper scoring rules. Be calibrated and decisive.
+            Apply exactly two principles:
+            1) Outside view / base rates first.
+            2) Consider-the-opposite: strongest case for a much-lower or much-higher outcome.
+
+            Role: {role}
+            Today: {datetime.now().strftime('%Y-%m-%d')}
+
+            Question: {question.question_text}
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
+            Fine Print: {question.fine_print}
+            Units: {unit}
+
+            Bounds guidance:
+            {low_msg}
+            {high_msg}
+
+            Research:
+            {research}
+
+            Write 6-10 bullets total, then output EXACTLY these lines at the end:
+            Percentile 10: X
+            Percentile 20: X
+            Percentile 40: X
+            Percentile 60: X
+            Percentile 80: X
+            Percentile 90: X
+        """)
+
+    async def _run_binary_role(self, question: BinaryQuestion, research: str, model_tag: str, role: str) -> ReasonedPrediction[float]:
+        model_name = f"forecaster_{model_tag}"
+        prompt = self._binary_prompt(question, research, role)
+
+        try:
+            raw = await self._invoke_with_format_retry(model_name, prompt, "Probability/Decimal lines")
+        except Exception as e:
+            self._inc_drop(model_tag, "llm_error_binary")
+            raise e
+
+        val = await self._parse_binary(raw, model_tag=model_tag)
+        if val is None:
+            # One short reprompt focused on format only
+            reprompt = clean_indents(f"""
+                Output ONLY the final two lines in this exact format (no other text):
+                Probability: ZZ%
+                Decimal: 0.ZZ
+            """)
+            try:
+                raw2 = await self._invoke_llm(model_name, reprompt)
+                val = await self._parse_binary(raw2, model_tag=model_tag)
+                raw = raw + "\n\n[FORMAT_RETRY]\n" + raw2
+            except Exception:
+                self._inc_drop(model_tag, "retry_failed_binary")
+
+        if val is None:
+            self._inc_drop(model_tag, "invalid_values_binary")
+            val = 0.5
+
+        return ReasonedPrediction(prediction_value=clamp01(val), reasoning=raw)
+
+    async def _run_mc_role(self, question: MultipleChoiceQuestion, research: str, model_tag: str, role: str) -> ReasonedPrediction[PredictedOptionList]:
+        model_name = f"forecaster_{model_tag}"
+        prompt = self._mc_prompt(question, research, role)
+
+        try:
+            raw = await self._invoke_with_format_retry(model_name, prompt, "Indexed option lines")
+        except Exception as e:
+            self._inc_drop(model_tag, "llm_error_mc")
+            raise e
+
+        probs = await self._parse_mc(raw, question, model_tag=model_tag)
+        if probs is None:
+            reprompt = clean_indents(f"""
+                Output ONLY the final probability lines using option numbers and percents.
+                Example:
+                1: 12%
+                2: 34%
+                ...
+                Must sum to 100%.
+            """)
+            try:
+                raw2 = await self._invoke_llm(model_name, reprompt)
+                probs = await self._parse_mc(raw2, question, model_tag=model_tag)
+                raw = raw + "\n\n[FORMAT_RETRY]\n" + raw2
+            except Exception:
+                self._inc_drop(model_tag, "retry_failed_mc")
+
+        if probs is None:
+            self._inc_drop(model_tag, "invalid_values_mc")
+            # uniform fallback
+            options = list(question.options)
+            u = 1.0 / max(1, len(options))
+            probs = {opt: u for opt in options}
+
+        # Build PredictedOptionList
+        predicted_options_list = [
+            PredictedOption(option_name=opt, probability=float(p))
+            for opt, p in probs.items()
+        ]
+        return ReasonedPrediction(
+            prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
+            reasoning=raw,
+        )
+
+    async def _run_numeric_role(self, question: NumericQuestion, research: str, model_tag: str, role: str) -> ReasonedPrediction[NumericDistribution]:
+        model_name = f"forecaster_{model_tag}"
+        prompt = self._numeric_prompt(question, research, role)
+
+        try:
+            raw = await self._invoke_with_format_retry(model_name, prompt, "Percentile lines")
+        except Exception as e:
+            self._inc_drop(model_tag, "llm_error_numeric")
+            raise e
+
+        dist = await self._parse_numeric(raw, question, model_tag=model_tag)
+        if dist is None:
+            reprompt = clean_indents(f"""
+                Output ONLY these lines (no other text):
+                Percentile 10: X
+                Percentile 20: X
+                Percentile 40: X
+                Percentile 60: X
+                Percentile 80: X
+                Percentile 90: X
+            """)
+            try:
+                raw2 = await self._invoke_llm(model_name, reprompt)
+                dist = await self._parse_numeric(raw2, question, model_tag=model_tag)
+                raw = raw + "\n\n[FORMAT_RETRY]\n" + raw2
+            except Exception:
+                self._inc_drop(model_tag, "retry_failed_numeric")
+
+        if dist is None:
+            self._inc_drop(model_tag, "invalid_values_numeric")
+            # midpoint fallback
+            try:
+                l = float(question.lower_bound) if question.lower_bound is not None else 0.0
+            except Exception:
+                l = 0.0
+            try:
+                u = float(question.upper_bound) if question.upper_bound is not None else 100.0
+            except Exception:
+                u = 100.0
+            mid = (l + u) / 2.0
+            dist = NumericDistribution.from_question([Percentile(value=mid, percentile=0.5)], question)
+
+        return ReasonedPrediction(prediction_value=dist, reasoning=raw)
 
     # -----------------------------
-    # Custom aggregation
+    # Abstract method implementations (kept, but GPT-only)
+    # -----------------------------
+    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
+        # For single-run fallback behavior, keep GPT primary
+        return await self._run_binary_role(question, research, model_tag="gpt", role="PRIMARY")
+
+    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
+        return await self._run_mc_role(question, research, model_tag="gpt", role="PRIMARY")
+
+    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        return await self._run_numeric_role(question, research, model_tag="gpt", role="PRIMARY")
+
+    # -----------------------------
+    # Custom aggregation (2 forecasters only)
     # -----------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
-        predictions: list[Any] = []
-        reasonings: list[str] = []
+        # Guard prediction too (reduces provider rate-limit drops)
+        async with self._concurrency_limiter:
+            preds: List[Any] = []
+            reasonings: List[str] = []
 
-        for i, model_tag in enumerate(self._run_schedule, start=1):
+            # Run GPT primary
             try:
                 if isinstance(question, BinaryQuestion):
-                    pred = await self._run_forecast_on_binary_internal(question, research, run_id=i, model_tag=model_tag)
+                    gpt_pred = await self._run_binary_role(question, research, "gpt", "PRIMARY")
                 elif isinstance(question, MultipleChoiceQuestion):
-                    pred = await self._run_forecast_on_multiple_choice_internal(question, research, run_id=i, model_tag=model_tag)
+                    gpt_pred = await self._run_mc_role(question, research, "gpt", "PRIMARY")
                 elif isinstance(question, NumericQuestion):
-                    pred = await self._run_forecast_on_numeric_internal(question, research, run_id=i, model_tag=model_tag)
+                    gpt_pred = await self._run_numeric_role(question, research, "gpt", "PRIMARY")
                 else:
                     raise ValueError(f"Unsupported question type: {type(question)}")
-
-                predictions.append(pred.prediction_value)
-                reasonings.append(pred.reasoning)
+                preds.append(gpt_pred.prediction_value)
+                reasonings.append("[GPT_PRIMARY]\n" + gpt_pred.reasoning)
             except Exception as e:
-                logger.error(f"Individual forecaster failed (run {i}, model={model_tag}): {e}")
-                continue
+                logger.error(f"GPT primary failed: {e}")
 
-        if not predictions:
-            raise RuntimeError("All forecasters failed.")
-
-        # BINARY
-        if isinstance(question, BinaryQuestion):
-            numeric_preds = [float(p) for p in predictions if _is_num(p)]
-            if not numeric_preds:
-                numeric_preds = [0.5]
-            med = median(numeric_preds)
-            m = mean(numeric_preds)
-            s = stdev(numeric_preds)
-            lo, hi = ci90(numeric_preds)
-            stats_line = f"[stats] n={len(numeric_preds)} mean={m:.3f} median={med:.3f} sd={s:.3f} ci90=({lo:.3f},{hi:.3f})"
-            return ReasonedPrediction(
-                prediction_value=max(0.01, min(0.99, float(med))),
-                reasoning=stats_line + " | " + " | ".join(reasonings),
-            )
-
-        # MULTIPLE CHOICE
-        if isinstance(question, MultipleChoiceQuestion):
-            options = list(question.options)
-            per_option_samples: Dict[str, List[float]] = {opt: [] for opt in options}
-            for p in predictions:
-                if isinstance(p, PredictedOptionList):
-                    pred_dict = {str(po.option_name).strip(): po.probability for po in p.predicted_options}
-                    for opt in options:
-                        v = pred_dict.get(opt)
-                        if v is None:
-                            v = pred_dict.get(opt.strip())
-                        if v is None:
-                            opt_cf = opt.casefold()
-                            for k, vv in pred_dict.items():
-                                if k.casefold() == opt_cf:
-                                    v = vv
-                                    break
-                        if v is not None and _is_num(v):
-                            per_option_samples[opt].append(float(v))
-            avg_probs: Dict[str, float] = {}
-            for opt in options:
-                avg_probs[opt] = median(per_option_samples[opt]) if per_option_samples[opt] else 0.0001
-            total = sum(avg_probs.values())
-            if total > 0:
-                avg_probs = {k: v / total for k, v in avg_probs.items()}
-            ent = entropy(avg_probs)
-            stats_line = f"[stats] n_runs={len(predictions)} entropy={ent:.3f} (lower=more confident)"
-            predicted_options_list = [
-                PredictedOption(option_name=opt, probability=float(prob))
-                for opt, prob in avg_probs.items()
-            ]
-            return ReasonedPrediction(
-                prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
-                reasoning=stats_line + " | " + " | ".join(reasonings),
-            )
-
-        # NUMERIC
-        if isinstance(question, NumericQuestion):
-            target_pts = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
-            median_percentiles: list[Percentile] = []
-            for pt in target_pts:
-                vals: list[float] = []
-                for p in predictions:
-                    if isinstance(p, NumericDistribution):
-                        for item in p.declared_percentiles:
-                            perc = normalize_percentile(getattr(item, "percentile", None))
-                            if abs(perc - pt) < 0.011:
-                                val = safe_float(getattr(item, "value", None), default=None)
-                                if val is not None:
-                                    vals.append(float(val))
-                if vals:
-                    med_val = median(vals)
+            # Run Claude adversarial checker (independent forecast, adversarial stance)
+            try:
+                if isinstance(question, BinaryQuestion):
+                    cl_pred = await self._run_binary_role(question, research, "claude", "ADVERSARIAL_CHECKER")
+                elif isinstance(question, MultipleChoiceQuestion):
+                    cl_pred = await self._run_mc_role(question, research, "claude", "ADVERSARIAL_CHECKER")
+                elif isinstance(question, NumericQuestion):
+                    cl_pred = await self._run_numeric_role(question, research, "claude", "ADVERSARIAL_CHECKER")
                 else:
-                    try:
-                        l = float(question.lower_bound) if question.lower_bound is not None else 0.0
-                    except Exception:
-                        l = 0.0
-                    try:
-                        u = float(question.upper_bound) if question.upper_bound is not None else 100.0
-                    except Exception:
-                        u = 100.0
-                    med_val = (l + u) / 2.0
-                median_percentiles.append(Percentile(percentile=pt, value=float(med_val)))
-            median_percentiles.sort(key=lambda x: float(x.percentile))
-            for i in range(1, len(median_percentiles)):
-                if median_percentiles[i].value < median_percentiles[i - 1].value:
-                    median_percentiles[i].value = median_percentiles[i - 1].value
-            p10 = next((p.value for p in median_percentiles if abs(float(p.percentile) - 0.1) < 1e-9), None)
-            p90 = next((p.value for p in median_percentiles if abs(float(p.percentile) - 0.9) < 1e-9), None)
-            spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
-            stats_line = f"[stats] n_runs={len(predictions)} p10={float(p10):.3f} p90={float(p90):.3f} spread(p90-p10)={float(spread):.3f}"
-            final_dist = NumericDistribution.from_question(median_percentiles, question)
-            return ReasonedPrediction(
-                prediction_value=final_dist,
-                reasoning=stats_line + " | " + " | ".join(reasonings),
-            )
+                    raise ValueError(f"Unsupported question type: {type(question)}")
+                preds.append(cl_pred.prediction_value)
+                reasonings.append("[CLAUDE_CHECKER]\n" + cl_pred.reasoning)
+            except Exception as e:
+                logger.error(f"Claude checker failed: {e}")
 
-        return ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
+            if not preds:
+                raise RuntimeError("All forecasters failed.")
+
+            w_gpt, w_claude = 0.70, 0.30
+
+            # BINARY: weighted blend
+            if isinstance(question, BinaryQuestion):
+                # If one missing, fall back to the one present
+                g = float(preds[0]) if len(preds) >= 1 and _is_num(preds[0]) else None
+                c = float(preds[1]) if len(preds) >= 2 and _is_num(preds[1]) else None
+
+                if g is not None and c is not None:
+                    final = clamp01(w_gpt * g + w_claude * c)
+                    numeric_preds = [g, c]
+                elif g is not None:
+                    final = clamp01(g)
+                    numeric_preds = [g]
+                elif c is not None:
+                    final = clamp01(c)
+                    numeric_preds = [c]
+                else:
+                    final = 0.5
+                    numeric_preds = [0.5]
+
+                med = median(numeric_preds)
+                m = mean(numeric_preds)
+                s = stdev(numeric_preds)
+                lo, hi = ci90(numeric_preds)
+                stats_line = (
+                    f"[stats] n={len(numeric_preds)} mean={m:.3f} median={med:.3f} "
+                    f"sd={s:.3f} ci90=({lo:.3f},{hi:.3f}) agg=weighted(0.7/0.3)"
+                )
+                return ReasonedPrediction(
+                    prediction_value=final,
+                    reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings),
+                )
+
+            # MULTIPLE CHOICE: weighted blend per option, renormalize
+            if isinstance(question, MultipleChoiceQuestion):
+                options = list(question.options)
+
+                # Convert PredictedOptionList to dict
+                def pol_to_dict(pol: Any) -> Dict[str, float]:
+                    out: Dict[str, float] = {}
+                    if isinstance(pol, PredictedOptionList):
+                        for po in pol.predicted_options:
+                            if _is_num(po.probability):
+                                out[str(po.option_name).strip()] = float(po.probability)
+                    return out
+
+                g_dict = pol_to_dict(preds[0]) if len(preds) >= 1 else {}
+                c_dict = pol_to_dict(preds[1]) if len(preds) >= 2 else {}
+
+                blended: Dict[str, float] = {}
+                for opt in options:
+                    gv = g_dict.get(opt)
+                    cv = c_dict.get(opt)
+                    if gv is None and cv is None:
+                        blended[opt] = 1e-6
+                    elif gv is None:
+                        blended[opt] = float(cv)
+                    elif cv is None:
+                        blended[opt] = float(gv)
+                    else:
+                        blended[opt] = w_gpt * float(gv) + w_claude * float(cv)
+
+                total = sum(blended.values())
+                if total <= 0:
+                    u = 1.0 / max(1, len(options))
+                    blended = {opt: u for opt in options}
+                else:
+                    blended = {k: v / total for k, v in blended.items()}
+
+                ent = entropy(blended)
+                stats_line = f"[stats] n_models={len(preds)} entropy={ent:.3f} agg=weighted(0.7/0.3)"
+                predicted_options_list = [
+                    PredictedOption(option_name=opt, probability=float(prob))
+                    for opt, prob in blended.items()
+                ]
+                return ReasonedPrediction(
+                    prediction_value=PredictedOptionList(predicted_options=predicted_options_list),
+                    reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings),
+                )
+
+            # NUMERIC: weighted blend of percentile values
+            if isinstance(question, NumericQuestion):
+                targets = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+
+                def dist_to_map(d: Any) -> Dict[float, float]:
+                    out: Dict[float, float] = {}
+                    if isinstance(d, NumericDistribution):
+                        for item in d.declared_percentiles:
+                            perc = normalize_percentile(getattr(item, "percentile", None))
+                            val = safe_float(getattr(item, "value", None), default=None)
+                            if val is None:
+                                continue
+                            out[perc] = float(val)
+                    return out
+
+                g_map = dist_to_map(preds[0]) if len(preds) >= 1 else {}
+                c_map = dist_to_map(preds[1]) if len(preds) >= 2 else {}
+
+                blended_pts: List[Percentile] = []
+                for pt in targets:
+                    gv = None
+                    cv = None
+                    # match closest declared percentile to pt
+                    if g_map:
+                        gv = min(g_map.items(), key=lambda kv: abs(kv[0] - pt))[1] if g_map else None
+                    if c_map:
+                        cv = min(c_map.items(), key=lambda kv: abs(kv[0] - pt))[1] if c_map else None
+
+                    if gv is None and cv is None:
+                        # fallback midpoint
+                        try:
+                            l = float(question.lower_bound) if question.lower_bound is not None else 0.0
+                        except Exception:
+                            l = 0.0
+                        try:
+                            u = float(question.upper_bound) if question.upper_bound is not None else 100.0
+                        except Exception:
+                            u = 100.0
+                        v = (l + u) / 2.0
+                    elif gv is None:
+                        v = float(cv)
+                    elif cv is None:
+                        v = float(gv)
+                    else:
+                        v = w_gpt * float(gv) + w_claude * float(cv)
+
+                    blended_pts.append(Percentile(percentile=pt, value=float(v)))
+
+                blended_pts.sort(key=lambda x: float(x.percentile))
+                for i in range(1, len(blended_pts)):
+                    if blended_pts[i].value < blended_pts[i - 1].value:
+                        blended_pts[i].value = blended_pts[i - 1].value
+
+                p10 = next((p.value for p in blended_pts if abs(float(p.percentile) - 0.1) < 1e-9), None)
+                p90 = next((p.value for p in blended_pts if abs(float(p.percentile) - 0.9) < 1e-9), None)
+                spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
+                stats_line = f"[stats] n_models={len(preds)} p10={float(p10):.3f} p90={float(p90):.3f} spread={float(spread):.3f} agg=weighted(0.7/0.3)"
+
+                final_dist = NumericDistribution.from_question(blended_pts, question)
+                return ReasonedPrediction(
+                    prediction_value=final_dist,
+                    reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings),
+                )
+
+            # Fallback for unknown types
+            return ReasonedPrediction(prediction_value=preds[0], reasoning="\n\n---\n\n".join(reasonings))
+
+    
+    def log_internal_drop_stats(self) -> None:
+        if not self._drop_counts:
+            return
+        logger.info(f"[drops] totals={self._drop_counts}")
+        logger.info(f"[drops] by_model={self._drop_counts_by_model}")
 
 # -----------------------------
 # MAIN
@@ -731,7 +1107,7 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run FinalTournamentBot2025 (AskNews + Tavily + 2-model ensemble)")
+    parser = argparse.ArgumentParser(description="Run FinalTournamentBot2025 (AskNews + Tavily + 2-model high-score intent)")
     parser.add_argument(
         "--tournament-ids",
         nargs="+",
@@ -746,7 +1122,7 @@ if __name__ == "__main__":
 
     bot = FinalTournamentBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=2,  
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
     )
@@ -762,6 +1138,8 @@ if __name__ == "__main__":
     try:
         reports = asyncio.run(run_all())
         bot.log_report_summary(reports)
+        # optional diagnostics:
+        bot.log_internal_drop_stats()
         logger.info("✅ FinalTournamentBot2025 run completed.")
     except Exception as e:
         logger.error(f"❌ Fatal error during execution: {e}")
