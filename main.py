@@ -8,14 +8,18 @@ import math
 from datetime import datetime
 from typing import List, Union, Dict, Any, Optional, Tuple
 
-# Optional: Tavily
+# -----------------------------
+# Optional: Tavily (REQUIRED at runtime)
+# -----------------------------
 try:
     from tavily import TavilyClient
     TAVILY_AVAILABLE = True
 except ImportError:
     TAVILY_AVAILABLE = False
 
-# AskNews integration
+# -----------------------------
+# AskNews integration (optional but supported)
+# -----------------------------
 try:
     from asknews_sdk import AskNewsSDK
     ASKNEWS_SDK_AVAILABLE = True
@@ -39,9 +43,9 @@ from forecasting_tools import (
     structure_output,
 )
 
-# -----------------------------
+# ============================================================
 # Helpers: robust stats + parsing
-# -----------------------------
+# ============================================================
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
@@ -182,7 +186,6 @@ def extract_numeric_percentiles(text: str, targets: List[float]) -> Dict[float, 
     if not text:
         return out
 
-    # capture 10/20/40/60/80/90 etc
     for pt in targets:
         pct_int = int(round(pt * 100))
         pats = [
@@ -199,9 +202,65 @@ def extract_numeric_percentiles(text: str, targets: List[float]) -> Dict[float, 
                     break
     return out
 
-# -----------------------------
+# ============================================================
+# Extremization (OPTIONAL) — Binary + MC only
+# ============================================================
+def _logit(p: float) -> float:
+    p = clamp01(p, 1e-6, 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+def _sigmoid(x: float) -> float:
+    # stable sigmoid
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+def extremize_binary(p: float, k: float) -> float:
+    """
+    Classic extremization via logit scaling:
+      p' = sigmoid(k * logit(p))
+    k=1 => no change; k>1 => more extreme; 0<k<1 => less extreme.
+    """
+    if not _is_num(p) or not _is_num(k):
+        return float(p)
+    if k <= 0:
+        return float(p)
+    if abs(k - 1.0) < 1e-12:
+        return float(p)
+    return clamp01(_sigmoid(_logit(float(p)) * float(k)))
+
+def extremize_mc(probs: Dict[str, float], k: float) -> Dict[str, float]:
+    """
+    Extremize multiclass probabilities via power transform:
+      p_i' = p_i^k / sum_j p_j^k
+    k=1 => no change; k>1 => sharper/more peaked; 0<k<1 => flatter.
+    """
+    if not probs:
+        return probs
+    if not _is_num(k) or k <= 0 or abs(k - 1.0) < 1e-12:
+        # normalize just in case
+        s = sum(max(0.0, float(v)) for v in probs.values())
+        if s > 0:
+            return {a: max(0.0, float(v)) / s for a, v in probs.items()}
+        n = len(probs)
+        return {a: 1.0 / n for a in probs}
+
+    powered: Dict[str, float] = {}
+    for a, v in probs.items():
+        pv = max(0.0, float(v))
+        powered[a] = pv ** float(k)
+
+    s2 = sum(powered.values())
+    if s2 <= 0:
+        n = len(probs)
+        return {a: 1.0 / n for a in probs}
+    return {a: v / s2 for a, v in powered.items()}
+
+# ============================================================
 # ASKNEWS QUERY BUILDER
-# -----------------------------
+# ============================================================
 def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
     q = (question.question_text or "").strip()
     bg = (question.background_info or "").strip()
@@ -236,21 +295,19 @@ def build_asknews_query(question: MetaculusQuestion, max_chars: int = 397) -> st
 
     return textwrap.shorten(q, width=max_chars, placeholder="…")
 
-# -----------------------------
-# Tavily Integration
-# -----------------------------
-def _get_tavily_client() -> Optional["TavilyClient"]:
+# ============================================================
+# Tavily Integration (REQUIRED)
+# ============================================================
+def _get_tavily_client() -> "TavilyClient":
     if not TAVILY_AVAILABLE:
-        return None
+        raise RuntimeError("Tavily is not installed. pip install tavily")
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        return None
+        raise RuntimeError("TAVILY_API_KEY is required (Tavily is not optional).")
     return TavilyClient(api_key=api_key)
 
 def _sync_tavily_search(query: str, max_results: int = 5) -> List[str]:
     client = _get_tavily_client()
-    if client is None:
-        return []
     try:
         response = client.search(
             query=query,
@@ -263,22 +320,23 @@ def _sync_tavily_search(query: str, max_results: int = 5) -> List[str]:
         snippets = []
         for i, res in enumerate(results[:max_results]):
             title = res.get("title", "Untitled")
-            content = (res.get("content", "") or "")[:500]
-            snippet = f"[T{i+1}] {title}: {textwrap.shorten(content, width=240, placeholder='…')}"
+            content = (res.get("content", "") or "")[:600]
+            url = res.get("url", "")
+            snippet = f"[T{i+1}] {title}: {textwrap.shorten(content, width=260, placeholder='…')}" + (f" ({url})" if url else "")
             snippets.append(snippet)
         return snippets
     except Exception as e:
         logger.error(f"Tavily search error: {e}")
         return []
 
-# -----------------------------
+# ============================================================
 # Logging + env
-# -----------------------------
+# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("FinalTournamentBot2025")
+logger = logging.getLogger("samcodes")
 
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET")
@@ -286,27 +344,23 @@ ASKNEWS_ENABLED = bool(ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET)
 if not ASKNEWS_ENABLED:
     logger.warning("ASKNEWS_CLIENT_ID/ASKNEWS_CLIENT_SECRET not set — AskNews disabled.")
 
-TAVILY_ENABLED = TAVILY_AVAILABLE and bool(os.getenv("TAVILY_API_KEY"))
-if not TAVILY_ENABLED:
-    logger.warning("TAVILY_API_KEY not set — Tavily disabled.")
-
-# -----------------------------
-# Bot Class (2-model, 2 principles)
-# -----------------------------
-class FinalTournamentBot2025(ForecastBot):
+# ============================================================
+# Bot Class (2-model + OPTIONAL extremization on probs)
+# ============================================================
+class samcodes(ForecastBot):
     """
     Two-model setup:
       - GPT-5.2: primary forecaster
       - Claude Sonnet 4.5: adversarial checker (still outputs a forecast)
 
-    Two core Good Judgment principles enforced in prompts:
-      1) Outside view / base rates first.
-      2) Consider-the-opposite (steelman the opposite side) before finalizing.
-
     Aggregation:
       - Binary: weighted blend 0.7 GPT / 0.3 Claude
       - Multiple choice: weighted blend per option, renormalize
       - Numeric: weighted blend of percentile values
+
+    NEW: Optional extremization (Binary + MC only):
+      - Binary: logit scaling with factor k_binary
+      - MC: power transform with factor k_mc
     """
 
     _max_concurrent_questions = 1
@@ -316,20 +370,31 @@ class FinalTournamentBot2025(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "researcher_gpt": "openrouter/openai/gpt-5.2",
-            "researcher_claude": "openrouter/anthropic/claude-sonnet-4.5",
+            "researcher": "openrouter/openai/gpt-5.2",          # used for synthesis if you later want it
             "forecaster_gpt": "openrouter/openai/gpt-5.2",
             "forecaster_claude": "openrouter/anthropic/claude-sonnet-4.5",
             "parser": "openrouter/anthropic/claude-sonnet-4.5",
         })
         return defaults
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        extremize_enabled: bool = False,
+        extremize_k_binary: float = 1.0,
+        extremize_k_mc: float = 1.0,
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self._asknews_client = None
-        logger.info("Initialized FinalTournamentBot2025 (AskNews + Tavily + 2-model high-score intent)")
-        # Only 2 runs total
-        self._run_schedule = ["gpt", "claude"]
+        self.extremize_enabled = bool(extremize_enabled)
+        self.extremize_k_binary = float(extremize_k_binary)
+        self.extremize_k_mc = float(extremize_k_mc)
+
+        logger.info(
+            f"Initialized samcodes (Tavily required, AskNews={ASKNEWS_ENABLED}, "
+            f"extremize={self.extremize_enabled} k_bin={self.extremize_k_binary} k_mc={self.extremize_k_mc})"
+        )
 
         # Drop accounting
         self._drop_counts: Dict[str, int] = {}
@@ -439,14 +504,14 @@ class FinalTournamentBot2025(ForecastBot):
                 return []
 
     # -----------------------------
-    # Research (concise, scorer-friendly)
+    # Research (ONLY Tavily + AskNews snippets; no LLM research)
     # -----------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             today_str = datetime.now().strftime("%Y-%m-%d")
             query = build_asknews_query(question)
 
-            # AskNews + Tavily snippets (optional)
+            # AskNews snippets (optional)
             asknews_summary = "[AskNews disabled]"
             if ASKNEWS_ENABLED:
                 try:
@@ -457,11 +522,11 @@ class FinalTournamentBot2025(ForecastBot):
                         for i, story in enumerate(stories[:5]):
                             if isinstance(story, dict):
                                 title = story.get("title", "Untitled")
-                                text = (story.get("text") or "")[:500]
+                                text = (story.get("text") or "")[:700]
                             else:
                                 title = getattr(story, "title", "Untitled")
-                                text = (getattr(story, "text", "") or "")[:500]
-                            snippets.append(f"[A{i+1}] {title}: {textwrap.shorten(text, width=220, placeholder='…')}")
+                                text = (getattr(story, "text", "") or "")[:700]
+                            snippets.append(f"[A{i+1}] {title}: {textwrap.shorten(text, width=260, placeholder='…')}")
                         asknews_summary = "\n".join(snippets)
                     else:
                         asknews_summary = "[AskNews: No recent stories found]"
@@ -469,82 +534,32 @@ class FinalTournamentBot2025(ForecastBot):
                     asknews_summary = f"[AskNews error: {str(e)}]"
                     logger.error(f"AskNews research failed: {e}")
 
-            tavily_summary = "[Tavily disabled]"
-            if TAVILY_ENABLED:
-                try:
-                    loop = asyncio.get_running_loop()
-                    tavily_snippets = await loop.run_in_executor(None, _sync_tavily_search, query)
-                    tavily_summary = "\n".join(tavily_snippets) if tavily_snippets else "[Tavily: No results found]"
-                except Exception as e:
-                    tavily_summary = f"[Tavily error: {str(e)}]"
-                    logger.error(f"Tavily research failed: {e}")
-
-            # Single structured research pass (GPT) + brief Claude check for missing angle
-            research_prompt = clean_indents(f"""
-                You are helping a forecaster maximize scoring rules (log/Brier). Be concise and decision-relevant.
-                Two principles:
-                1) Outside view/base rates first.
-                2) Consider-the-opposite: strongest case for the other side.
-
-                Question: {question.question_text}
-                Resolution Criteria: {question.resolution_criteria}
-                Fine Print: {question.fine_print}
-
-                Output <= 200 words in this exact structure:
-                - Key facts (dated):
-                - Outside view / base rate:
-                - Main drivers to watch:
-                - Strongest case for opposite outcome:
-                - What would change your mind:
-            """)
-
+            # Tavily snippets (REQUIRED)
+            tavily_summary = "[Tavily: No results found]"
             try:
-                llm_gpt = self.get_llm("researcher_gpt", "llm")
-                gpt_research = await llm_gpt.invoke(research_prompt)
+                loop = asyncio.get_running_loop()
+                tavily_snippets = await loop.run_in_executor(None, _sync_tavily_search, query)
+                tavily_summary = "\n".join(tavily_snippets) if tavily_snippets else "[Tavily: No results found]"
             except Exception as e:
-                gpt_research = f"[LLM research (GPT) failed: {str(e)}]"
+                tavily_summary = f"[Tavily error: {str(e)}]"
+                logger.error(f"Tavily research failed: {e}")
 
-            try:
-                llm_claude = self.get_llm("researcher_claude", "llm")
-                claude_gap_check = await llm_claude.invoke(clean_indents(f"""
-                    You are the adversarial checker. Find missing considerations that would materially change the forecast.
-                    Keep <= 120 words. Bullet points only.
-
-                    Question: {question.question_text}
-                    Resolution Criteria: {question.resolution_criteria}
-
-                    Research draft:
-                    {gpt_research}
-
-                    Output:
-                    - Missing consideration(s):
-                    - Potential direction of update (up/down) and why:
-                """))
-            except Exception as e:
-                claude_gap_check = f"[LLM gap-check (Claude) failed: {str(e)}]"
-
+            # NOTE: no GPT research, no Claude gap-check — just evidence.
             return (
                 f"--- LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
-                f"--- WEB SEARCH SNIPPETS ---\n{tavily_summary}\n\n"
-                f"--- STRUCTURED RESEARCH (GPT-5.2) ---\n{gpt_research}\n\n"
-                f"--- ADVERSARIAL GAP CHECK (SONNET-4.5) ---\n{claude_gap_check}"
+                f"--- WEB SEARCH SNIPPETS (TAVILY) ---\n{tavily_summary}\n"
             )
 
     # -----------------------------
-    # Forecast invocation helpers (retry + fallbacks)
+    # Forecast invocation helpers (fallback parsers)
     # -----------------------------
     async def _invoke_llm(self, model_name: str, prompt: str) -> str:
         llm = self.get_llm(model_name, "llm")
         return await llm.invoke(prompt)
 
     async def _invoke_with_format_retry(self, model_name: str, prompt: str, format_spec: str) -> str:
-        """
-        One retry if the first response likely violates format.
-        """
-        try:
-            return await self._invoke_llm(model_name, prompt)
-        except Exception:
-            raise
+        # Keep simple: provider retry handled upstream
+        return await self._invoke_llm(model_name, prompt)
 
     async def _parse_binary(self, raw: str, model_tag: str) -> Optional[float]:
         # Structured parse attempt
@@ -587,13 +602,13 @@ class FinalTournamentBot2025(ForecastBot):
                 prob = po.probability
                 if _is_num(prob):
                     pred_dict[name] = float(prob)
+
             # Map to canonical options (best-effort)
             out: Dict[str, float] = {}
             for opt in options:
                 if opt in pred_dict:
                     out[opt] = pred_dict[opt]
                 else:
-                    # casefold match
                     opt_cf = opt.casefold()
                     for k, v in pred_dict.items():
                         if k.casefold() == opt_cf:
@@ -679,10 +694,9 @@ class FinalTournamentBot2025(ForecastBot):
         return low_msg, high_msg
 
     # -----------------------------
-    # Core forecasting (GPT primary + Claude adversarial checker)
+    # Prompts
     # -----------------------------
     def _binary_prompt(self, question: BinaryQuestion, research: str, role: str) -> str:
-        # Two Good Judgment principles baked in, plus scoring intent.
         return clean_indents(f"""
             You are forecasting to maximize proper scoring rules (log score / Brier). Be calibrated and decisive.
             Apply exactly two principles:
@@ -697,7 +711,7 @@ class FinalTournamentBot2025(ForecastBot):
             Resolution Criteria: {question.resolution_criteria}
             Fine Print: {question.fine_print}
 
-            Research:
+            Research (ONLY SOURCES; no extra research steps):
             {research}
 
             Write 6-10 bullets total, then output EXACTLY these two lines at the end:
@@ -725,7 +739,7 @@ class FinalTournamentBot2025(ForecastBot):
             Options (numbered, MUST use these numbers in your final lines):
             {chr(10).join(indexed)}
 
-            Research:
+            Research (ONLY SOURCES; no extra research steps):
             {research}
 
             Write 6-10 bullets total, then output EXACTLY n lines at the end:
@@ -758,7 +772,7 @@ class FinalTournamentBot2025(ForecastBot):
             {low_msg}
             {high_msg}
 
-            Research:
+            Research (ONLY SOURCES; no extra research steps):
             {research}
 
             Write 6-10 bullets total, then output EXACTLY these lines at the end:
@@ -770,6 +784,9 @@ class FinalTournamentBot2025(ForecastBot):
             Percentile 90: X
         """)
 
+    # -----------------------------
+    # Role runs
+    # -----------------------------
     async def _run_binary_role(self, question: BinaryQuestion, research: str, model_tag: str, role: str) -> ReasonedPrediction[float]:
         model_name = f"forecaster_{model_tag}"
         prompt = self._binary_prompt(question, research, role)
@@ -782,8 +799,7 @@ class FinalTournamentBot2025(ForecastBot):
 
         val = await self._parse_binary(raw, model_tag=model_tag)
         if val is None:
-            # One short reprompt focused on format only
-            reprompt = clean_indents(f"""
+            reprompt = clean_indents("""
                 Output ONLY the final two lines in this exact format (no other text):
                 Probability: ZZ%
                 Decimal: 0.ZZ
@@ -813,7 +829,7 @@ class FinalTournamentBot2025(ForecastBot):
 
         probs = await self._parse_mc(raw, question, model_tag=model_tag)
         if probs is None:
-            reprompt = clean_indents(f"""
+            reprompt = clean_indents("""
                 Output ONLY the final probability lines using option numbers and percents.
                 Example:
                 1: 12%
@@ -830,12 +846,10 @@ class FinalTournamentBot2025(ForecastBot):
 
         if probs is None:
             self._inc_drop(model_tag, "invalid_values_mc")
-            # uniform fallback
             options = list(question.options)
             u = 1.0 / max(1, len(options))
             probs = {opt: u for opt in options}
 
-        # Build PredictedOptionList
         predicted_options_list = [
             PredictedOption(option_name=opt, probability=float(p))
             for opt, p in probs.items()
@@ -857,7 +871,7 @@ class FinalTournamentBot2025(ForecastBot):
 
         dist = await self._parse_numeric(raw, question, model_tag=model_tag)
         if dist is None:
-            reprompt = clean_indents(f"""
+            reprompt = clean_indents("""
                 Output ONLY these lines (no other text):
                 Percentile 10: X
                 Percentile 20: X
@@ -875,7 +889,6 @@ class FinalTournamentBot2025(ForecastBot):
 
         if dist is None:
             self._inc_drop(model_tag, "invalid_values_numeric")
-            # midpoint fallback
             try:
                 l = float(question.lower_bound) if question.lower_bound is not None else 0.0
             except Exception:
@@ -890,10 +903,9 @@ class FinalTournamentBot2025(ForecastBot):
         return ReasonedPrediction(prediction_value=dist, reasoning=raw)
 
     # -----------------------------
-    # Abstract method implementations (kept, but GPT-only)
+    # Abstract method implementations (kept, GPT-only fallback)
     # -----------------------------
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        # For single-run fallback behavior, keep GPT primary
         return await self._run_binary_role(question, research, model_tag="gpt", role="PRIMARY")
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
@@ -903,10 +915,9 @@ class FinalTournamentBot2025(ForecastBot):
         return await self._run_numeric_role(question, research, model_tag="gpt", role="PRIMARY")
 
     # -----------------------------
-    # Custom aggregation (2 forecasters only)
+    # Custom aggregation (2 forecasters only) + OPTIONAL extremization
     # -----------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
-        # Guard prediction too (reduces provider rate-limit drops)
         async with self._concurrency_limiter:
             preds: List[Any] = []
             reasonings: List[str] = []
@@ -926,14 +937,14 @@ class FinalTournamentBot2025(ForecastBot):
             except Exception as e:
                 logger.error(f"GPT primary failed: {e}")
 
-            # Run Claude adversarial checker (independent forecast, adversarial stance)
+            # Run Claude checker
             try:
                 if isinstance(question, BinaryQuestion):
-                    cl_pred = await self._run_binary_role(question, research, "claude", "ADVERSARIAL_CHECKER")
+                    cl_pred = await self._run_binary_role(question, research, "claude", "CHECKER")
                 elif isinstance(question, MultipleChoiceQuestion):
-                    cl_pred = await self._run_mc_role(question, research, "claude", "ADVERSARIAL_CHECKER")
+                    cl_pred = await self._run_mc_role(question, research, "claude", "CHECKER")
                 elif isinstance(question, NumericQuestion):
-                    cl_pred = await self._run_numeric_role(question, research, "claude", "ADVERSARIAL_CHECKER")
+                    cl_pred = await self._run_numeric_role(question, research, "claude", "CHECKER")
                 else:
                     raise ValueError(f"Unsupported question type: {type(question)}")
                 preds.append(cl_pred.prediction_value)
@@ -946,9 +957,10 @@ class FinalTournamentBot2025(ForecastBot):
 
             w_gpt, w_claude = 0.70, 0.30
 
-            # BINARY: weighted blend
+            # -----------------------------
+            # BINARY: weighted blend (+ optional extremize)
+            # -----------------------------
             if isinstance(question, BinaryQuestion):
-                # If one missing, fall back to the one present
                 g = float(preds[0]) if len(preds) >= 1 and _is_num(preds[0]) else None
                 c = float(preds[1]) if len(preds) >= 2 and _is_num(preds[1]) else None
 
@@ -965,6 +977,10 @@ class FinalTournamentBot2025(ForecastBot):
                     final = 0.5
                     numeric_preds = [0.5]
 
+                final_pre_ext = final
+                if self.extremize_enabled and self.extremize_k_binary and abs(self.extremize_k_binary - 1.0) > 1e-12:
+                    final = extremize_binary(final, self.extremize_k_binary)
+
                 med = median(numeric_preds)
                 m = mean(numeric_preds)
                 s = stdev(numeric_preds)
@@ -973,16 +989,20 @@ class FinalTournamentBot2025(ForecastBot):
                     f"[stats] n={len(numeric_preds)} mean={m:.3f} median={med:.3f} "
                     f"sd={s:.3f} ci90=({lo:.3f},{hi:.3f}) agg=weighted(0.7/0.3)"
                 )
+                if self.extremize_enabled:
+                    stats_line += f" extremize_bin(k={self.extremize_k_binary:.3f}) {final_pre_ext:.3f}->{final:.3f}"
+
                 return ReasonedPrediction(
                     prediction_value=final,
                     reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings),
                 )
 
-            # MULTIPLE CHOICE: weighted blend per option, renormalize
+            # -----------------------------
+            # MULTIPLE CHOICE: weighted blend (+ optional extremize)
+            # -----------------------------
             if isinstance(question, MultipleChoiceQuestion):
                 options = list(question.options)
 
-                # Convert PredictedOptionList to dict
                 def pol_to_dict(pol: Any) -> Dict[str, float]:
                     out: Dict[str, float] = {}
                     if isinstance(pol, PredictedOptionList):
@@ -1014,8 +1034,15 @@ class FinalTournamentBot2025(ForecastBot):
                 else:
                     blended = {k: v / total for k, v in blended.items()}
 
+                blended_pre_ext = dict(blended)
+                if self.extremize_enabled and self.extremize_k_mc and abs(self.extremize_k_mc - 1.0) > 1e-12:
+                    blended = extremize_mc(blended, self.extremize_k_mc)
+
                 ent = entropy(blended)
                 stats_line = f"[stats] n_models={len(preds)} entropy={ent:.3f} agg=weighted(0.7/0.3)"
+                if self.extremize_enabled:
+                    stats_line += f" extremize_mc(k={self.extremize_k_mc:.3f})"
+
                 predicted_options_list = [
                     PredictedOption(option_name=opt, probability=float(prob))
                     for opt, prob in blended.items()
@@ -1025,7 +1052,9 @@ class FinalTournamentBot2025(ForecastBot):
                     reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings),
                 )
 
-            # NUMERIC: weighted blend of percentile values
+            # -----------------------------
+            # NUMERIC: weighted blend of percentiles (NO extremize)
+            # -----------------------------
             if isinstance(question, NumericQuestion):
                 targets = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
 
@@ -1047,14 +1076,12 @@ class FinalTournamentBot2025(ForecastBot):
                 for pt in targets:
                     gv = None
                     cv = None
-                    # match closest declared percentile to pt
                     if g_map:
-                        gv = min(g_map.items(), key=lambda kv: abs(kv[0] - pt))[1] if g_map else None
+                        gv = min(g_map.items(), key=lambda kv: abs(kv[0] - pt))[1]
                     if c_map:
-                        cv = min(c_map.items(), key=lambda kv: abs(kv[0] - pt))[1] if c_map else None
+                        cv = min(c_map.items(), key=lambda kv: abs(kv[0] - pt))[1]
 
                     if gv is None and cv is None:
-                        # fallback midpoint
                         try:
                             l = float(question.lower_bound) if question.lower_bound is not None else 0.0
                         except Exception:
@@ -1089,42 +1116,58 @@ class FinalTournamentBot2025(ForecastBot):
                     reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings),
                 )
 
-            # Fallback for unknown types
             return ReasonedPrediction(prediction_value=preds[0], reasoning="\n\n---\n\n".join(reasonings))
 
-    
     def log_internal_drop_stats(self) -> None:
         if not self._drop_counts:
             return
         logger.info(f"[drops] totals={self._drop_counts}")
         logger.info(f"[drops] by_model={self._drop_counts_by_model}")
 
-# -----------------------------
+
+# ============================================================
 # MAIN
-# -----------------------------
+# ============================================================
 if __name__ == "__main__":
     litellm_logger = logging.getLogger("litellm")
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run FinalTournamentBot2025 (AskNews + Tavily + 2-model high-score intent)")
+    parser = argparse.ArgumentParser(description="Run samcodes (Tavily required, AskNews optional, 2-model aggregation + optional extremize)")
     parser.add_argument(
         "--tournament-ids",
         nargs="+",
         type=str,
         default=["minibench", "32916", "market-pulse-26q1", "ACX2026"],
     )
+
+    # Optional extremization (Binary + MC only)
+    parser.add_argument("--extremize", action="store_true", help="Enable extremization for Binary + MC probabilities")
+    parser.add_argument("--extremize-k-binary", type=float, default=1.0, help="Binary logit-scaling factor (k>1 more extreme)")
+    parser.add_argument("--extremize-k-mc", type=float, default=1.0, help="MC power factor (k>1 sharper)")
+
     args = parser.parse_args()
 
     if not os.getenv("OPENROUTER_API_KEY"):
         logger.error("❌ OPENROUTER_API_KEY is required")
         raise SystemExit(1)
 
-    bot = FinalTournamentBot2025(
+    # Tavily is required
+    if not TAVILY_AVAILABLE:
+        logger.error("❌ Tavily package not installed. Run: pip install tavily")
+        raise SystemExit(1)
+    if not os.getenv("TAVILY_API_KEY"):
+        logger.error("❌ TAVILY_API_KEY is required (Tavily is not optional)")
+        raise SystemExit(1)
+
+    bot = samcodes(
         research_reports_per_question=1,
-        predictions_per_research_report=2,  
+        predictions_per_research_report=2,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
+        extremize_enabled=bool(args.extremize),
+        extremize_k_binary=float(args.extremize_k_binary),
+        extremize_k_mc=float(args.extremize_k_mc),
     )
 
     async def run_all():
@@ -1138,9 +1181,8 @@ if __name__ == "__main__":
     try:
         reports = asyncio.run(run_all())
         bot.log_report_summary(reports)
-        # optional diagnostics:
         bot.log_internal_drop_stats()
-        logger.info("✅ FinalTournamentBot2025 run completed.")
+        logger.info("✅ samcodes run completed.")
     except Exception as e:
         logger.error(f"❌ Fatal error during execution: {e}")
         raise SystemExit(1)
