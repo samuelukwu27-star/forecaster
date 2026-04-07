@@ -406,9 +406,9 @@ class samcodes(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "researcher": "openrouter/openai/gpt-5.2",
-            "forecaster_gpt": "openrouter/openai/gpt-5.2",
-            "forecaster_claude": "openrouter/anthropic/claude-sonnet-4.5",
+            "researcher": "openrouter/openai/gpt-5.4",
+            "forecaster_gpt": "openrouter/openai/gpt-5.4",
+            "forecaster_claude": "openrouter/anthropic/claude-sonnet-4.6",
             "parser": "openrouter/anthropic/claude-sonnet-4.5",
         })
         return defaults
