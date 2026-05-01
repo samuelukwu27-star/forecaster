@@ -268,18 +268,27 @@ def minibench_extremize_binary(
     agree   = _agents_agree(g_val, c_val)
     strong  = _research_is_strong(research)
     in_zone = MINIBENCH_CONV_LO <= blend <= MINIBENCH_CONV_HI
+    low_confidence = False
+
+    if g_val is not None and c_val is not None:
+        low_confidence = abs(float(g_val) - float(c_val)) < 0.12
+    elif in_zone:
+        low_confidence = True
+
+    if in_zone and low_confidence and not strong:
+        return 0.5, MINIBENCH_K_MAX, f"T7(mid_low_conf {blend:.3f}->0.500)"
 
     if in_zone and agree and strong:
-        pos    = blend > 0.50
+        pos = blend > 0.50
         result = MINIBENCH_CONV_POS if pos else MINIBENCH_CONV_NEG
         return result, MINIBENCH_K_MAX, f"T5({'pos' if pos else 'neg'} {blend:.3f}->{result:.3f})"
 
-    k        = MINIBENCH_K_BASE
-    triggers = ["T1(base)"]
+    k = MINIBENCH_K_MAX
+    triggers = ["T0(extreme)"]
     if agree:
-        k = min(k + MINIBENCH_K_AGREE, MINIBENCH_K_MAX); triggers.append("T2(agree)")
+        triggers.append("T2(agree)")
     if strong:
-        k = min(k + MINIBENCH_K_RESEARCH, MINIBENCH_K_MAX); triggers.append("T3(research)")
+        triggers.append("T3(research)")
 
     result = clamp01(_sigmoid(_logit(clamp01(blend, 1e-6, 1 - 1e-6)) * k))
 
@@ -399,17 +408,17 @@ ASKNEWS_ENABLED = bool(ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET)
 # Bot Class
 # ============================================================
 class samcodes(ForecastBot):
-    _max_concurrent_questions = 1
+    _max_concurrent_questions = 5
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "researcher": "openrouter/openai/gpt-5.4",
-            "forecaster_gpt": "openrouter/openai/gpt-5.4",
-            "forecaster_claude": "openrouter/anthropic/claude-sonnet-4.6",
-            "parser": "openrouter/anthropic/claude-sonnet-4.5",
+            "researcher": "openrouter/perplexity/sonar-pro",
+            "forecaster_gpt": "openrouter/perplexity/sonar-pro",
+            "forecaster_claude": "openrouter/perplexity/sonar-pro",
+            "parser": "openrouter/perplexity/sonar-pro",
         })
         return defaults
 
@@ -528,31 +537,41 @@ class samcodes(ForecastBot):
                 except Exception as e:
                     logger.warning(f"Ticker extraction failed: {e}")
 
-            # Standard AskNews + Tavily Search
-            asknews_summary = "[AskNews disabled]"
-            if ASKNEWS_ENABLED:
+            async def get_asknews_summary() -> str:
+                if not ASKNEWS_ENABLED:
+                    return "[AskNews disabled]"
                 try:
                     loop = asyncio.get_running_loop()
                     stories = await loop.run_in_executor(None, self._sync_asknews_search, query)
-                    if stories:
-                        snippets = []
-                        for i, story in enumerate(stories[:5]):
-                            title = story.get("title", "Untitled") if isinstance(story, dict) else getattr(story, "title", "Untitled")
-                            text = (story.get("text") or "")[:700] if isinstance(story, dict) else (getattr(story, "text", "") or "")[:700]
-                            snippets.append(f"[A{i+1}] {title}: {textwrap.shorten(text, width=260, placeholder='…')}")
-                        asknews_summary = "\n".join(snippets)
-                    else:
-                        asknews_summary = "[AskNews: No recent stories found]"
+                    if not stories:
+                        return "[AskNews: No recent stories found]"
+                    snippets = []
+                    for i, story in enumerate(stories[:5]):
+                        if isinstance(story, dict):
+                            title = story.get("title", "Untitled")
+                            text = (story.get("text") or "")[:700]
+                        else:
+                            title = getattr(story, "title", "Untitled")
+                            text = (getattr(story, "text", "") or "")[:700]
+                        snippets.append(f"[A{i+1}] {title}: {textwrap.shorten(text, width=260, placeholder='…')}")
+                    return "\n".join(snippets)
                 except Exception as e:
-                    asknews_summary = f"[AskNews error: {str(e)}]"
+                    logger.error(f"AskNews research failed: {e}")
+                    return f"[AskNews error: {str(e)}]"
 
-            tavily_summary = "[Tavily: No results found]"
-            try:
-                loop = asyncio.get_running_loop()
-                tavily_snippets = await loop.run_in_executor(None, _sync_tavily_search, query)
-                tavily_summary = "\n".join(tavily_snippets) if tavily_snippets else "[Tavily: No results found]"
-            except Exception as e:
-                tavily_summary = f"[Tavily error: {str(e)}]"
+            async def get_tavily_summary() -> str:
+                try:
+                    loop = asyncio.get_running_loop()
+                    tavily_snippets = await loop.run_in_executor(None, _sync_tavily_search, query)
+                    return "\n".join(tavily_snippets) if tavily_snippets else "[Tavily: No results found]"
+                except Exception as e:
+                    logger.error(f"Tavily research failed: {e}")
+                    return f"[Tavily error: {str(e)}]"
+
+            asknews_summary, tavily_summary = await asyncio.gather(
+                get_asknews_summary(),
+                get_tavily_summary(),
+            )
 
             return (
                 f"{financial_data}"
@@ -565,7 +584,19 @@ class samcodes(ForecastBot):
     # -----------------------------
     async def _invoke_llm(self, model_name: str, prompt: str) -> str:
         llm = self.get_llm(model_name, "llm")
-        return await llm.invoke(prompt)
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                return await llm.invoke(prompt)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= 3:
+                    logger.error(f"[LLM fail] {model_name} attempt {attempt}: {exc}")
+                    break
+                logger.warning(f"[LLM retry] {model_name} attempt {attempt}: {exc}")
+                await asyncio.sleep(0.5 * attempt)
+        # [Retry] recover transient OpenRouter errors. I think this is right because temporary API timeouts are common.
+        raise last_exc if last_exc is not None else RuntimeError("LLM invocation failed")
 
     async def _invoke_with_format_retry(self, model_name: str, prompt: str, format_spec: str) -> str:
         return await self._invoke_llm(model_name, prompt)
@@ -868,8 +899,9 @@ class samcodes(ForecastBot):
                 blend = clamp01(w_gpt * g + w_claude * c) if (g and c) else clamp01(g or c or 0.5)
                 numeric_preds = [v for v in (g, c) if v is not None] or [0.5]
 
-                final, ext_log = blend, "extremize=OFF"
-                if self.extremize_enabled:
+                final = blend
+                ext_log = "extremize=OFF"
+                if is_mb or self.extremize_enabled:
                     if is_mb:
                         final, eff_k, trigs = minibench_extremize_binary(blend, g, c, research)
                         ext_log = f"minibench({trigs} k_eff={eff_k:.1f}) {blend:.3f}->{final:.3f}"
@@ -898,7 +930,7 @@ class samcodes(ForecastBot):
                 blended = {k: v / total for k, v in blended.items()} if total > 0 else {opt: 1.0/max(1, len(options)) for opt in options}
 
                 ext_log = "extremize=OFF"
-                if self.extremize_enabled:
+                if is_mb or self.extremize_enabled:
                     k_mc = MINIBENCH_K_MC if is_mb else self.extremize_k_mc
                     if abs(k_mc - 1.0) > 1e-12:
                         blended = extremize_mc(blended, k_mc)
@@ -965,8 +997,16 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run samcodes with yfinance + AskNews + Extremization")
-    parser.add_argument("--tournament-ids", nargs="+", type=str, default=["minibench", "32916", "market-pulse-26q2"])
+    parser = argparse.ArgumentParser(description="Run samcodes (Tavily required, AskNews optional, 2-model aggregation + optional extremize)")
+
+    # Target tournaments exclusively updated here
+    parser.add_argument(
+        "--tournament-ids",
+        nargs="+",
+        type=str,
+        default=["minibench", "33022", "market-pulse-26q2"],
+    )
+
     parser.add_argument("--extremize", action="store_true", help="Enable extremization for Binary + MC probabilities")
     parser.add_argument("--extremize-k-binary", type=float, default=1.0)
     parser.add_argument("--extremize-k-mc", type=float, default=1.0)
