@@ -416,6 +416,8 @@ class samcodes(ForecastBot):
         defaults = super()._llm_config_defaults()
         defaults.update({
             "researcher": "openrouter/gpt-5.5",
+            "researcher_search": "openrouter/perplexity/sonar-pro-search",
+            "researcher_reasoning": "openrouter/perplexity/sonar-reasoning-pro",
             "forecaster_gpt": "openrouter/gpt-5.1",
             "forecaster_claude": "openrouter/perplexity/sonar-pro",
             "parser": "openrouter/perplexity/sonar-pro",
@@ -455,6 +457,8 @@ class samcodes(ForecastBot):
     def set_active_tournament(self, tid: str) -> None:
         self._active_tournament = str(tid).strip().lower()
         logger.info(f"Active tournament: '{self._active_tournament}'")
+        if self._active_tournament == "33022":
+            logger.info("Using explicit median aggregation pipeline for tournament 33022.")
 
     def _inc_drop(self, model_tag: str, reason: str) -> None:
         self._drop_counts[reason] = self._drop_counts.get(reason, 0) + 1
@@ -568,7 +572,7 @@ class samcodes(ForecastBot):
                     logger.error(f"Tavily research failed: {e}")
                     return f"[Tavily error: {str(e)}]"
 
-            async def get_openrouter_search() -> str:
+            async def get_openrouter_gpt55_search() -> str:
                 try:
                     prompt = clean_indents(f"""
                         You are an online research assistant with access to OpenRouter GPT-5.5.
@@ -579,22 +583,56 @@ class samcodes(ForecastBot):
                         and cite any sources or URLs when available.
                     """)
                     result = await self._invoke_llm("researcher", prompt)
-                    return result.strip() or "[OpenRouter search returned no content]"
+                    return result.strip() or "[OpenRouter GPT-5.5 search returned no content]"
                 except Exception as e:
-                    logger.error(f"OpenRouter research failed: {e}")
-                    return f"[OpenRouter error: {str(e)}]"
+                    logger.error(f"OpenRouter GPT-5.5 research failed: {e}")
+                    return f"[OpenRouter GPT-5.5 error: {str(e)}]"
 
-            asknews_summary, tavily_summary, openrouter_summary = await asyncio.gather(
+            async def get_sonar_pro_search() -> str:
+                try:
+                    prompt = clean_indents(f"""
+                        You are a web research assistant.
+                        Search for the most relevant and recent information about this query:
+                        {query}
+
+                        Provide a concise summary of findings and point to any useful evidence.
+                    """)
+                    result = await self._invoke_llm("researcher_search", prompt)
+                    return result.strip() or "[Sonar Pro Search returned no content]"
+                except Exception as e:
+                    logger.error(f"Sonar Pro Search failed: {e}")
+                    return f"[Sonar Pro Search error: {str(e)}]"
+
+            async def get_sonar_reasoning_pro() -> str:
+                try:
+                    prompt = clean_indents(f"""
+                        You are a reasoning-focused research assistant.
+                        Analyze the following query and return a high-quality reasoning summary:
+                        {query}
+
+                        Include relevant evidence, key points, and any useful interpretations.
+                    """)
+                    result = await self._invoke_llm("researcher_reasoning", prompt)
+                    return result.strip() or "[Sonar Reasoning Pro returned no content]"
+                except Exception as e:
+                    logger.error(f"Sonar Reasoning Pro failed: {e}")
+                    return f"[Sonar Reasoning Pro error: {str(e)}]"
+
+            asknews_summary, tavily_summary, openrouter_summary, sonar_search_summary, sonar_reasoning_summary = await asyncio.gather(
                 get_asknews_summary(),
                 get_tavily_summary(),
-                get_openrouter_search(),
+                get_openrouter_gpt55_search(),
+                get_sonar_pro_search(),
+                get_sonar_reasoning_pro(),
             )
 
             return (
                 f"{financial_data}"
                 f"--- LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
                 f"--- WEB SEARCH SNIPPETS (TAVILY) ---\n{tavily_summary}\n\n"
-                f"--- OPENROUTER GPT-5.5 SEARCH ---\n{openrouter_summary}\n"
+                f"--- OPENROUTER GPT-5.5 SEARCH ---\n{openrouter_summary}\n\n"
+                f"--- SONAR PRO SEARCH ---\n{sonar_search_summary}\n\n"
+                f"--- SONAR REASONING PRO ---\n{sonar_reasoning_summary}\n"
             )
 
     # -----------------------------
@@ -908,6 +946,7 @@ class samcodes(ForecastBot):
 
             if not preds: raise RuntimeError("All forecasters failed.")
             w_gpt, w_claude = 0.70, 0.30
+            use_median_33022 = self._active_tournament == "33022"
 
             # --- BINARY ---
             if isinstance(question, BinaryQuestion):
@@ -929,7 +968,8 @@ class samcodes(ForecastBot):
                         final = extremize_binary(blend, self.extremize_k_binary)
                         ext_log = f"extremize_bin(k={self.extremize_k_binary:.3f}) {blend:.3f}->{final:.3f}"
 
-                stats_line = f"[stats] n={len(numeric_preds)} median={median(numeric_preds):.3f} agg=median {ext_log}"
+                median_tag = "_33022" if use_median_33022 else ""
+                stats_line = f"[stats] n={len(numeric_preds)} median={median(numeric_preds):.3f} agg=median{median_tag} {ext_log}"
                 return ReasonedPrediction(prediction_value=final, reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings))
 
             # --- MULTIPLE CHOICE ---
@@ -956,7 +996,8 @@ class samcodes(ForecastBot):
                         blended = extremize_mc(blended, k_mc)
                         ext_log = f"extremize_mc(k={k_mc:.3f}{'[mb]' if is_mb else ''})"
 
-                stats_line = f"[stats] n={len(preds)} entropy={entropy(blended):.3f} agg=median {ext_log}"
+                median_tag = "_33022" if use_median_33022 else ""
+                stats_line = f"[stats] n={len(preds)} entropy={entropy(blended):.3f} agg=median{median_tag} {ext_log}"
                 predicted_options_list = [PredictedOption(option_name=opt, probability=float(prob)) for opt, prob in blended.items()]
                 return ReasonedPrediction(prediction_value=PredictedOptionList(predicted_options=predicted_options_list), reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings))
 
@@ -1000,7 +1041,8 @@ class samcodes(ForecastBot):
                 p90 = next((p.value for p in blended_pts if abs(float(p.percentile) - 0.9) < 1e-9), None)
                 spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
                 
-                stats_line = f"[stats] n={len(preds)} p10={float(p10 or 0):.3f} p90={float(p90 or 0):.3f} spread={float(spread):.3f} agg=median {ext_log}"
+                median_tag = "_33022" if use_median_33022 else ""
+                stats_line = f"[stats] n={len(preds)} p10={float(p10 or 0):.3f} p90={float(p90 or 0):.3f} spread={float(spread):.3f} agg=median{median_tag} {ext_log}"
 
                 final_dist = NumericDistribution.from_question(blended_pts, question)
                 return ReasonedPrediction(prediction_value=final_dist, reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings))
