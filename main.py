@@ -237,8 +237,8 @@ def apply_tail_fattening(pts: List[Percentile], factor: float = 1.15) -> List[Pe
 MINIBENCH_K_BASE      = 5.0
 MINIBENCH_K_AGREE     = 1.0
 MINIBENCH_K_RESEARCH  = 1.0
-MINIBENCH_K_MAX       = 7.0
-MINIBENCH_K_MC        = 3.5
+MINIBENCH_K_MAX       = 3.75
+MINIBENCH_K_MC        = 3.75
 MINIBENCH_GATE_LO     = 0.40
 MINIBENCH_GATE_HI     = 0.60
 MINIBENCH_GATE_AMP    = 1.5
@@ -415,8 +415,8 @@ class samcodes(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "researcher": "openrouter/perplexity/sonar-pro",
-            "forecaster_gpt": "openrouter/perplexity/sonar-pro",
+            "researcher": "openrouter/gpt-5.5",
+            "forecaster_gpt": "openrouter/gpt-5.1",
             "forecaster_claude": "openrouter/perplexity/sonar-pro",
             "parser": "openrouter/perplexity/sonar-pro",
         })
@@ -568,15 +568,33 @@ class samcodes(ForecastBot):
                     logger.error(f"Tavily research failed: {e}")
                     return f"[Tavily error: {str(e)}]"
 
-            asknews_summary, tavily_summary = await asyncio.gather(
+            async def get_openrouter_search() -> str:
+                try:
+                    prompt = clean_indents(f"""
+                        You are an online research assistant with access to OpenRouter GPT-5.5.
+                        Perform a concise, up-to-date search summary for the following query:
+                        {query}
+
+                        Provide the most relevant recent findings, include short evidence snippets,
+                        and cite any sources or URLs when available.
+                    """)
+                    result = await self._invoke_llm("researcher", prompt)
+                    return result.strip() or "[OpenRouter search returned no content]"
+                except Exception as e:
+                    logger.error(f"OpenRouter research failed: {e}")
+                    return f"[OpenRouter error: {str(e)}]"
+
+            asknews_summary, tavily_summary, openrouter_summary = await asyncio.gather(
                 get_asknews_summary(),
                 get_tavily_summary(),
+                get_openrouter_search(),
             )
 
             return (
                 f"{financial_data}"
                 f"--- LIVE NEWS (as of {today_str}) ---\n{asknews_summary}\n\n"
-                f"--- WEB SEARCH SNIPPETS (TAVILY) ---\n{tavily_summary}\n"
+                f"--- WEB SEARCH SNIPPETS (TAVILY) ---\n{tavily_summary}\n\n"
+                f"--- OPENROUTER GPT-5.5 SEARCH ---\n{openrouter_summary}\n"
             )
 
     # -----------------------------
@@ -896,8 +914,10 @@ class samcodes(ForecastBot):
                 g = float(preds[0]) if len(preds) >= 1 and _is_num(preds[0]) else None
                 c = float(preds[1]) if len(preds) >= 2 and _is_num(preds[1]) else None
 
-                blend = clamp01(w_gpt * g + w_claude * c) if (g and c) else clamp01(g or c or 0.5)
-                numeric_preds = [v for v in (g, c) if v is not None] or [0.5]
+                numeric_preds = [v for v in (g, c) if v is not None]
+                if not numeric_preds:
+                    numeric_preds = [0.5]
+                blend = clamp01(median(numeric_preds))
 
                 final = blend
                 ext_log = "extremize=OFF"
@@ -909,7 +929,7 @@ class samcodes(ForecastBot):
                         final = extremize_binary(blend, self.extremize_k_binary)
                         ext_log = f"extremize_bin(k={self.extremize_k_binary:.3f}) {blend:.3f}->{final:.3f}"
 
-                stats_line = f"[stats] n={len(numeric_preds)} mean={mean(numeric_preds):.3f} agg=weighted(0.7/0.3) {ext_log}"
+                stats_line = f"[stats] n={len(numeric_preds)} median={median(numeric_preds):.3f} agg=median {ext_log}"
                 return ReasonedPrediction(prediction_value=final, reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings))
 
             # --- MULTIPLE CHOICE ---
@@ -921,10 +941,10 @@ class samcodes(ForecastBot):
                 blended = {}
                 for opt in options:
                     gv, cv = g_dict.get(opt), c_dict.get(opt)
-                    if gv is None and cv is None: blended[opt] = 1e-6
-                    elif gv is None: blended[opt] = float(cv)
-                    elif cv is None: blended[opt] = float(gv)
-                    else: blended[opt] = w_gpt * float(gv) + w_claude * float(cv)
+                    values = []
+                    if gv is not None: values.append(float(gv))
+                    if cv is not None: values.append(float(cv))
+                    blended[opt] = median(values) if values else 1e-6
 
                 total = sum(blended.values())
                 blended = {k: v / total for k, v in blended.items()} if total > 0 else {opt: 1.0/max(1, len(options)) for opt in options}
@@ -936,7 +956,7 @@ class samcodes(ForecastBot):
                         blended = extremize_mc(blended, k_mc)
                         ext_log = f"extremize_mc(k={k_mc:.3f}{'[mb]' if is_mb else ''})"
 
-                stats_line = f"[stats] n={len(preds)} entropy={entropy(blended):.3f} agg=weighted(0.7/0.3) {ext_log}"
+                stats_line = f"[stats] n={len(preds)} entropy={entropy(blended):.3f} agg=median {ext_log}"
                 predicted_options_list = [PredictedOption(option_name=opt, probability=float(prob)) for opt, prob in blended.items()]
                 return ReasonedPrediction(prediction_value=PredictedOptionList(predicted_options=predicted_options_list), reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings))
 
@@ -958,9 +978,11 @@ class samcodes(ForecastBot):
 
                     if gv is None and cv is None:
                         v = (float(getattr(question, "lower_bound", 0.0) or 0.0) + float(getattr(question, "upper_bound", 100.0) or 100.0)) / 2.0
-                    elif gv is None: v = float(cv)
-                    elif cv is None: v = float(gv)
-                    else: v = w_gpt * float(gv) + w_claude * float(cv)
+                    else:
+                        values = []
+                        if gv is not None: values.append(float(gv))
+                        if cv is not None: values.append(float(cv))
+                        v = median(values) if values else 0.0
 
                     blended_pts.append(Percentile(percentile=pt, value=float(v)))
 
@@ -978,7 +1000,7 @@ class samcodes(ForecastBot):
                 p90 = next((p.value for p in blended_pts if abs(float(p.percentile) - 0.9) < 1e-9), None)
                 spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
                 
-                stats_line = f"[stats] n={len(preds)} p10={float(p10 or 0):.3f} p90={float(p90 or 0):.3f} spread={float(spread):.3f} agg=weighted(0.7/0.3) {ext_log}"
+                stats_line = f"[stats] n={len(preds)} p10={float(p10 or 0):.3f} p90={float(p90 or 0):.3f} spread={float(spread):.3f} agg=median {ext_log}"
 
                 final_dist = NumericDistribution.from_question(blended_pts, question)
                 return ReasonedPrediction(prediction_value=final_dist, reasoning=stats_line + "\n\n" + "\n\n---\n\n".join(reasonings))
