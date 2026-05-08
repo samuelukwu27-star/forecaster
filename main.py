@@ -1012,18 +1012,28 @@ class samcodes(ForecastBot):
                 g_map = dist_to_map(preds[0]) if len(preds) >= 1 else {}
                 c_map = dist_to_map(preds[1]) if len(preds) >= 2 else {}
 
+                # Calculate allowed range for percentiles: question bounds +/- 25%
+                lower = float(getattr(question, "lower_bound", 0.0) or 0.0)
+                upper = float(getattr(question, "upper_bound", 100.0) or 100.0)
+                range_ = upper - lower
+                allowed_min = lower - 0.25 * range_
+                allowed_max = upper + 0.25 * range_
+
                 blended_pts: List[Percentile] = []
                 for pt in targets:
                     gv = min(g_map.items(), key=lambda kv: abs(kv[0] - pt))[1] if g_map else None
                     cv = min(c_map.items(), key=lambda kv: abs(kv[0] - pt))[1] if c_map else None
 
                     if gv is None and cv is None:
-                        v = (float(getattr(question, "lower_bound", 0.0) or 0.0) + float(getattr(question, "upper_bound", 100.0) or 100.0)) / 2.0
+                        v = (lower + upper) / 2.0
                     else:
                         values = []
                         if gv is not None: values.append(float(gv))
                         if cv is not None: values.append(float(cv))
                         v = median(values) if values else 0.0
+
+                    # Clamp v to allowed range
+                    v = max(allowed_min, min(allowed_max, v))
 
                     blended_pts.append(Percentile(percentile=pt, value=float(v)))
 
