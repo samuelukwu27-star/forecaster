@@ -1096,7 +1096,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=2,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
         extremize_enabled=bool(args.extremize),
         extremize_k_binary=float(args.extremize_k_binary),
         extremize_k_mc=float(args.extremize_k_mc),
