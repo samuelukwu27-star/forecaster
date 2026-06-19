@@ -415,7 +415,7 @@ class samcodes(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "researcher": "openrouter/openai/openai/gpt-oss-120b:free",
+            "researcher": "openrouter/openai/gpt-oss-120b:free",
             "researcher_search": "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
             "researcher_reasoning": "openrouter/openai/gpt-oss-120b:free",
             "forecaster_gpt": "openrouter/free",
